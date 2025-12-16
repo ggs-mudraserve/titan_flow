@@ -79,6 +79,16 @@ config :titan_flow, :webhook_verify_token, System.get_env("WEBHOOK_VERIFY_TOKEN"
 # Admin PIN for dashboard access
 config :titan_flow, :admin_pin, System.get_env("ADMIN_PIN", "766100")
 
+# HTTP Client Connection Pool for High-Speed Sending
+# 10 phones × 50 MPS × 300ms avg latency = ~150 concurrent connections
+# Setting to 500 for safety margin during high-volume campaigns
+config :tesla, adapter: {Tesla.Adapter.Hackney, 
+  recv_timeout: 30_000,           # 30 second timeout for slow Meta API responses
+  pool: :default,                 # Use default Hackney pool
+  max_connections: 500            # Support 500 MPS (10 phones × 50 MPS)
+}
+
+
 if config_env() == :prod do
   maybe_ipv6 = if System.get_env("ECTO_IPV6") in ~w(true 1), do: [:inet6], else: []
 

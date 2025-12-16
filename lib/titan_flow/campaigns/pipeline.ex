@@ -63,9 +63,7 @@ defmodule TitanFlow.Campaigns.Pipeline do
         phone_number_id: phone_number_id,
         campaign_id: campaign_id,
         # List of template IDs assigned to this phone
-        template_ids: template_ids,
-        # Round-robin index for template rotation
-        template_index: 0
+        template_ids: template_ids
       }
     )
   end
@@ -94,8 +92,7 @@ defmodule TitanFlow.Campaigns.Pipeline do
     %{
       phone_number_id: phone_number_id,
       campaign_id: campaign_id,
-      template_ids: template_ids,
-      template_index: template_index
+      template_ids: template_ids
     } = context
 
     # Check if campaign is paused - if so, re-queue safely
@@ -111,11 +108,15 @@ defmodule TitanFlow.Campaigns.Pipeline do
       try do
         case get_valid_phone(campaign_id, phone_number_id) do
           {:ok, active_phone_id} ->
-            # NEW LOGIC: Get template for THIS phone from senders_config
-            {template_name, language_code, new_index} = get_template_for_phone(template_ids, template_index)
+            # Get contact_id from message data for template rotation
+            contact_id = case Jason.decode(data) do
+              {:ok, payload} -> payload["contact_id"] || 0
+              _ -> 0
+            end
             
-            # Update context with new template index for next message
-            Process.put(:template_index, new_index)
+            # Use contact_id for deterministic template selection (round-robin per contact)
+            # This ensures consistent template selection even after pipeline restarts
+            {template_name, language_code} = get_template_for_phone(template_ids, contact_id)
 
             case Jason.decode(data) do
               {:ok, payload} ->
@@ -196,20 +197,23 @@ defmodule TitanFlow.Campaigns.Pipeline do
 
   # Private Functions
 
-  defp get_template_for_phone(template_ids, current_index) when length(template_ids) > 0 do
-    # Round-robin template selection
-    template_id = Enum.at(template_ids, rem(current_index, length(template_ids)))
+  defp get_template_for_phone(template_ids, contact_id) when length(template_ids) > 0 do
+    # Use contact_id modulo template count for deterministic round-robin
+    # This ensures: contact 1 -> template #0, contact 2 -> template #1, etc.
+    # Benefits: Stateless, survives pipeline restarts, distributes templates evenly
+    template_index = rem(contact_id, length(template_ids))
+    template_id = Enum.at(template_ids, template_index)
     
     # Fetch template from database
     template = TitanFlow.Templates.get_template!(template_id)
     
-    {template.name, template.language || "en", current_index + 1}
+    {template.name, template.language || "en"}
   end
-  defp get_template_for_phone([], _current_index) do
+  defp get_template_for_phone([], _contact_id) do
     # No templates configured - this shouldn't happen but provide fallback
     require Logger
     Logger.error("No templates configured for this phone")
-    {"default", "en", 0}
+    {"default", "en"}
   end
 
   defp dispatch_with_retry(message, payload, phone_number_id, campaign_id, template_name, language_code, retry_count) do
@@ -272,12 +276,25 @@ defmodule TitanFlow.Campaigns.Pipeline do
             error_message = extract_api_error_message(body)
             error_code = extract_api_error_code(body) || status_code
             
-            Task.start(fn ->
+            # CRITICAL ERROR HANDLING: Payment errors must be synchronous
+            # to immediately mark phone as exhausted and prevent wasted sends
+            if is_critical_error?(error_code) do
+              # Synchronous for payment/account errors - phone exhaustion MUST happen NOW
               MessageTracking.record_failed(
                 campaign_id, payload["contact_id"], payload["phone"],
                 template_name, error_code, error_message, phone_number_id
               )
-            end)
+              require Logger
+              Logger.error("Critical error #{error_code} for phone #{phone_number_id}: #{error_message}")
+            else
+              # Async for non-critical errors - maintain speed
+              Task.start(fn ->
+                MessageTracking.record_failed(
+                  campaign_id, payload["contact_id"], payload["phone"],
+                  template_name, error_code, error_message, phone_number_id
+                )
+              end)
+            end
             Message.failed(message, "API error #{status_code}: #{error_message}")
 
           {:error, reason} ->
@@ -379,4 +396,18 @@ defmodule TitanFlow.Campaigns.Pipeline do
     get_in(body, ["error", "error_subcode"])
   end
   defp extract_api_error_code(_body), do: nil
+
+  # Check if error code is critical (payment/account issues)
+  # Critical errors require SYNCHRONOUS handling to immediately mark phone as exhausted
+  defp is_critical_error?(error_code) when is_integer(error_code) do
+    error_code in [
+      131042,  # Payment issue (most common)
+      131048,  # Account flagged 
+      131053   # Account locked
+    ]
+  end
+  defp is_critical_error?(error_code) when is_binary(error_code) do
+    error_code in ["131042", "131048", "131053"]
+  end
+  defp is_critical_error?(_), do: false
 end
