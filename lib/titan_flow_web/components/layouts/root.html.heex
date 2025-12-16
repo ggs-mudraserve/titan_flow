@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <meta name="theme-color" content="#09090b" />
+    <meta name="description" content="TitanFlow - WhatsApp Campaign Management Platform" />
+    <.live_title suffix=" · TitanFlow">
+      <%= assigns[:page_title] || "Dashboard" %>
+    </.live_title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <link phx-track-static rel="stylesheet" href={~p"/assets/css/app.css"} />
+    <script defer phx-track-static type="text/javascript" src={~p"/assets/js/app.js"}>
+    </script>
+  </head>
+  <body class="h-full bg-zinc-950 text-zinc-100">
+    <%= @inner_content %>
+
+    <script>
+      // Service Worker Registration
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js')
+            .then(registration => {
+              console.log('SW registered:', registration);
+            })
+            .catch(error => {
+              console.log('SW registration failed:', error);
+            });
+        });
+      }
+
+      // PWA Install Prompt Logic
+      let deferredPrompt;
+      window.deferredPrompt = null;
+
+      window.canInstallPWA = function() {
+        return !!window.deferredPrompt;
+      };
+
+      window.installPWA = function() {
+        if (!window.deferredPrompt) return;
+        
+        window.deferredPrompt.prompt();
+        window.deferredPrompt.userChoice.then((choiceResult) => {
+          if (choiceResult.outcome === 'accepted') {
+            console.log('User accepted the install prompt');
+          } else {
+            console.log('User dismissed the install prompt');
+          }
+          window.deferredPrompt = null;
+          window.dispatchEvent(new Event('pwa-installed'));
+        });
+      };
+
+      window.addEventListener('beforeinstallprompt', (e) => {
+        // Prevent Chrome 67 and earlier from automatically showing the prompt
+        e.preventDefault();
+        // Stash the event so it can be triggered later.
+        window.deferredPrompt = e;
+        console.log('PWA install available');
+        // Notify UI to show install button
+        window.dispatchEvent(new Event('pwa-install-available'));
+      });
+
+      window.addEventListener('appinstalled', (evt) => {
+        console.log('PWA was installed');
+        window.deferredPrompt = null;
+        window.dispatchEvent(new Event('pwa-installed'));
+      });
+    </script>
+  </body>
+</html>

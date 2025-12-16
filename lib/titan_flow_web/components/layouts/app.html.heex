@@ -1,0 +1,68 @@
+<div class="flex h-full bg-zinc-950">
+  <!-- Sidebar -->
+  <aside class="w-64 bg-zinc-900 border-r border-zinc-800 flex flex-col">
+    <!-- Logo -->
+    <div class="h-16 flex items-center px-4 border-b border-zinc-800">
+      <img src="/images/logo.png" alt="TitanFlow" class="h-8 w-auto" />
+    </div>
+
+    <!-- Navigation -->
+    <nav class="flex-1 px-3 py-4 space-y-1">
+      <.nav_link href="/dashboard" icon="📊" label="Dashboard" active={@current_path == "/dashboard"} />
+      <.nav_link href="/campaigns" icon="🚀" label="Campaigns" active={@current_path == "/campaigns"} />
+      <.nav_link href="/inbox" icon="💬" label="Inbox" active={@current_path == "/inbox"} />
+      <.nav_link href="/numbers" icon="📱" label="WhatsApp Numbers" active={@current_path == "/numbers"} />
+      <.nav_link href="/templates" icon="📄" label="Templates" active={@current_path == "/templates"} />
+      <.nav_link href="/settings" icon="⚙️" label="Settings" active={@current_path == "/settings"} />
+    </nav>
+
+    <!-- Install PWA Button + Footer -->
+    <div class="p-3 border-t border-zinc-800 space-y-3">
+      <!-- Install App Button (PWA) - Hidden by default, shown when installable -->
+      <button
+        id="install-app-btn"
+        onclick="window.installPWA && window.installPWA()"
+        class="hidden w-full items-center justify-center gap-2 h-8 px-3 rounded text-sm font-medium bg-indigo-600 hover:bg-indigo-500 text-white transition-colors"
+      >
+        <span>📲</span>
+        <span>Install App</span>
+      </button>
+      <p class="text-xs text-zinc-500">TitanFlow v1.0</p>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="flex-1 overflow-auto bg-zinc-950">
+    <div class="p-6">
+      <.flash_group flash={@flash} />
+      <%= @inner_content %>
+    </div>
+  </main>
+</div>
+
+<!-- Script to show Install button when PWA is installable -->
+<script>
+  (function() {
+    const btn = document.getElementById('install-app-btn');
+    
+    function updateInstallBtn() {
+      if (window.canInstallPWA && window.canInstallPWA()) {
+        btn.classList.remove('hidden');
+        btn.classList.add('flex');
+      } else {
+        btn.classList.add('hidden');
+        btn.classList.remove('flex');
+      }
+    }
+    
+    // Check on load
+    updateInstallBtn();
+    
+    // Listen for install availability
+    window.addEventListener('pwa-install-available', updateInstallBtn);
+    window.addEventListener('pwa-installed', function() {
+      btn.classList.add('hidden');
+      btn.classList.remove('flex');
+    });
+  })();
+</script>

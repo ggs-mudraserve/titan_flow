@@ -1,0 +1,272 @@
+/* See the Tailwind configuration guide for advanced usage
+   https://tailwindcss.com/docs/configuration */
+
+@import "tailwindcss" source(none);
+@source "../css";
+@source "../js";
+@source "../../lib/titan_flow_web";
+
+/* A Tailwind plugin that makes "hero-#{ICON}" classes available.
+   The heroicons installation itself is managed by your mix.exs */
+@plugin "../vendor/heroicons";
+
+/* daisyUI Tailwind Plugin. You can update this file by fetching the latest version with:
+   curl -sLO https://github.com/saadeghi/daisyui/releases/latest/download/daisyui.js
+   Make sure to look at the daisyUI changelog: https://daisyui.com/docs/changelog/ */
+@plugin "../vendor/daisyui" {
+  themes: false;
+}
+
+/* daisyUI theme plugin - Linear-style Dark Theme Configuration */
+@plugin "../vendor/daisyui-theme" {
+  name: "dark";
+  default: true;
+  prefersdark: true;
+  color-scheme: "dark";
+
+  /* Background colors - Deep zinc palette */
+  --color-base-100: oklch(17.1% 0.006 285.885);
+  /* zinc-900 #18181b - Cards/Surfaces */
+  --color-base-200: oklch(12.9% 0.002 285.885);
+  /* zinc-950 #09090b - Main Background */
+  --color-base-300: oklch(22.8% 0.006 285.885);
+  /* zinc-800 - Elevated surfaces */
+  --color-base-content: oklch(95.5% 0.002 285.885);
+  /* zinc-100 - Primary text */
+
+  /* Primary - Indigo accent (Linear-style) */
+  --color-primary: oklch(58.5% 0.233 277.117);
+  /* indigo-500 */
+  --color-primary-content: oklch(100% 0 0);
+  /* white */
+
+  /* Secondary - Violet accent */
+  --color-secondary: oklch(59.8% 0.24 292.717);
+  /* violet-500 */
+  --color-secondary-content: oklch(100% 0 0);
+
+  /* Accent - Indigo-400 for hover states */
+  --color-accent: oklch(67.3% 0.201 277.117);
+  /* indigo-400 */
+  --color-accent-content: oklch(100% 0 0);
+
+  /* Neutral - zinc-700 for borders */
+  --color-neutral: oklch(28.5% 0.006 285.885);
+  /* zinc-700 */
+  --color-neutral-content: oklch(95.5% 0.002 285.885);
+
+  /* Semantic colors */
+  --color-info: oklch(62% 0.214 259.815);
+  --color-info-content: oklch(100% 0 0);
+
+  --color-success: oklch(70% 0.176 166.113);
+  /* emerald-500 */
+  --color-success-content: oklch(100% 0 0);
+
+  --color-warning: oklch(77.1% 0.167 54.783);
+  /* amber-500 */
+  --color-warning-content: oklch(14.9% 0.039 46.201);
+
+  --color-error: oklch(57.7% 0.245 27.325);
+  /* red-500 */
+  --color-error-content: oklch(100% 0 0);
+
+  /* Border radius - More subtle, Linear-style */
+  --radius-selector: 0.375rem;
+  --radius-field: 0.375rem;
+  --radius-box: 0.5rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+/* Add variants based on LiveView classes */
+@custom-variant phx-click-loading (.phx-click-loading&, .phx-click-loading &);
+@custom-variant phx-submit-loading (.phx-submit-loading&, .phx-submit-loading &);
+@custom-variant phx-change-loading (.phx-change-loading&, .phx-change-loading &);
+
+/* Make LiveView wrapper divs transparent for layout */
+[data-phx-session],
+[data-phx-teleported-src] {
+  display: contents
+}
+
+/* ============================================
+   LINEAR-STYLE DARK THEME - GLOBAL STYLES
+   ============================================ */
+
+/* Typography - System fonts for fast loading */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.font-mono,
+code,
+pre,
+.data-field {
+  font-family: 'SF Mono', Monaco, 'Fira Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+}
+
+/* Secondary text color */
+.text-secondary {
+  color: #a1a1aa;
+  /* zinc-400 */
+}
+
+/* Dense Button Styling */
+.btn-dense {
+  @apply h-8 px-3 rounded text-sm font-medium transition-colors;
+  @apply focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-700;
+}
+
+.btn-primary {
+  @apply bg-indigo-600 hover:bg-indigo-500 text-white;
+}
+
+.btn-secondary {
+  @apply bg-zinc-800 hover:bg-zinc-700 text-zinc-100 border border-zinc-700;
+}
+
+.btn-danger {
+  @apply bg-red-600 hover:bg-red-500 text-white;
+}
+
+.btn-ghost {
+  @apply bg-transparent hover:bg-zinc-800 text-zinc-400 hover:text-zinc-100;
+}
+
+/* Dense Table Styling */
+.table-dense th {
+  @apply py-2 px-4 text-xs font-medium text-zinc-400 uppercase tracking-wider;
+  @apply border-b border-zinc-800 bg-zinc-900/50;
+}
+
+.table-dense td {
+  @apply py-2 px-4 text-sm border-b border-zinc-800;
+}
+
+.table-dense tbody tr:hover {
+  @apply bg-zinc-800/50;
+}
+
+/* Data fields use monospace */
+.table-dense .data-cell {
+  @apply font-mono text-zinc-300;
+}
+
+/* Dense Input Styling */
+.input-dense {
+  @apply h-8 px-3 rounded text-sm font-medium transition-colors;
+  @apply bg-zinc-900 border border-zinc-800 text-zinc-100;
+  @apply placeholder-zinc-500;
+  @apply focus:outline-none focus:ring-1 focus:ring-indigo-500/50 focus:border-indigo-500;
+}
+
+.input-dense:hover {
+  @apply border-zinc-700;
+}
+
+/* Card styling */
+.card-surface {
+  @apply bg-zinc-900 border border-zinc-800 rounded-lg;
+}
+
+.card-elevated {
+  @apply bg-zinc-900 border border-zinc-800 rounded-lg shadow-xl shadow-black/20;
+}
+
+/* Status Badge Base */
+.badge {
+  @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium;
+}
+
+.badge-success {
+  @apply bg-emerald-500/20 text-emerald-400 border border-emerald-500/30;
+}
+
+.badge-warning {
+  @apply bg-amber-500/20 text-amber-400 border border-amber-500/30;
+}
+
+.badge-error {
+  @apply bg-red-500/20 text-red-400 border border-red-500/30;
+}
+
+.badge-info {
+  @apply bg-blue-500/20 text-blue-400 border border-blue-500/30;
+}
+
+.badge-neutral {
+  @apply bg-zinc-700/50 text-zinc-400 border border-zinc-700;
+}
+
+/* Accent highlights for stats */
+.stat-accent {
+  @apply text-indigo-400;
+}
+
+/* Smooth scrollbar for dark theme */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #09090b;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+/* Modal backdrop */
+.modal-backdrop {
+  @apply fixed inset-0 bg-black/60 backdrop-blur-sm z-50;
+}
+
+.modal-content {
+  @apply bg-zinc-900 border border-zinc-800 rounded-xl shadow-2xl;
+}
+
+/* Page transitions */
+.page-enter {
+  animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Focus ring for accessibility - removed global override to prevent conflicts */
+
+/* Selection color */
+::selection {
+  background: rgba(99, 102, 241, 0.3);
+  color: white;
+}
+
+/* Install App Button (PWA) */
+#install-app-btn {
+  @apply hidden;
+}
+
+#install-app-btn.visible {
+  @apply flex;
+}

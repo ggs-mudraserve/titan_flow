@@ -1,0 +1,44 @@
+[Unit]
+Description=TitanFlow WhatsApp Campaign Server
+Documentation=https://github.com/your-org/titan_flow
+After=network.target postgresql.service redis.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=/root/titan_flow
+
+# Environment
+Environment=MIX_ENV=prod
+Environment=PHX_SERVER=true
+Environment=LANG=en_US.UTF-8
+EnvironmentFile=/root/titan_flow/.env.production
+
+# Start command
+ExecStart=/root/titan_flow/_build/prod/rel/titan_flow/bin/titan_flow start
+
+# Stop command (graceful shutdown)
+ExecStop=/root/titan_flow/_build/prod/rel/titan_flow/bin/titan_flow stop
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+# Resource limits (adjust based on your VPS)
+# LimitNOFILE=65535
+# MemoryMax=2G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=titan_flow
+
+# Security hardening (optional)
+# NoNewPrivileges=true
+# PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
