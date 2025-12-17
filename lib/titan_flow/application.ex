@@ -45,6 +45,9 @@ defmodule TitanFlow.Application do
       # DynamicSupervisor for BufferManagers
       {DynamicSupervisor, strategy: :one_for_one, name: TitanFlow.BufferSupervisor},
 
+      # DynamicSupervisor for Campaign Pipelines (auto-restart on crash)
+      {DynamicSupervisor, strategy: :one_for_one, name: TitanFlow.Campaigns.PipelineSupervisor},
+
       # DynamicSupervisor for Phone Number Rate Limiters
       {DynamicSupervisor, strategy: :one_for_one, name: TitanFlow.PhoneSupervisor},
 

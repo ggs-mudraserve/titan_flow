@@ -619,20 +619,27 @@ defmodule TitanFlowWeb.CampaignLive.New do
             <%= cond do %>
               <% @import_status == "ready" -> %>
                 <div class="mt-4 p-3 rounded-lg border bg-emerald-500/10 border-emerald-500/30">
-                  <div class="flex flex-col gap-1">
-                    <div class="flex items-center gap-2">
-                      <span class="text-emerald-400">✓</span>
-                      <span class="text-sm text-emerald-400">
-                        Ready! <span class="font-mono font-medium"><%= @import_count %></span> contacts imported
-                      </span>
-                    </div>
-                    <%= if @draft_campaign && @draft_campaign.skipped_count > 0 do %>
-                      <div class="text-xs text-zinc-500 ml-6">
-                        <span class="text-amber-400"><%= @draft_campaign.skipped_count %></span> duplicates skipped (within <%= @draft_campaign.dedup_window_days %> days)
-                      </div>
-                    <% end %>
+                  <div class="flex items-center gap-2">
+                    <span class="text-emerald-400">✓</span>
+                    <span class="text-sm text-emerald-400">
+                      Ready! <span class="font-mono font-medium"><%= @import_count %></span> contacts imported
+                    </span>
                   </div>
                 </div>
+                
+                <%= if @draft_campaign && @draft_campaign.skipped_count > 0 do %>
+                  <div class="mt-3 p-3 rounded-lg border bg-amber-500/10 border-amber-500/30">
+                    <div class="flex items-center gap-2">
+                      <span class="text-amber-400">⚠️</span>
+                      <span class="text-sm font-medium text-amber-300">
+                        <span class="font-mono font-bold"><%= @draft_campaign.skipped_count %></span> duplicate contacts removed
+                      </span>
+                    </div>
+                    <div class="text-xs text-amber-400/80 ml-7 mt-1">
+                      Already contacted within the last <%= @draft_campaign.dedup_window_days %> day<%= if @draft_campaign.dedup_window_days > 1, do: "s", else: "" %>
+                    </div>
+                  </div>
+                <% end %>
               <% @import_status == "importing" -> %>
                 <div class="mt-4 p-3 rounded-lg border bg-amber-500/10 border-amber-500/30">
                   <div class="flex items-center gap-2">

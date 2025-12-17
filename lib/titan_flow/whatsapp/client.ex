@@ -56,7 +56,8 @@ defmodule TitanFlow.WhatsApp.Client do
            headers: [
              {"Authorization", "Bearer #{access_token}"},
              {"Content-Type", "application/json"}
-           ]
+           ],
+           receive_timeout: 30_000
          ) do
       {:ok, %Req.Response{status: status, body: body, headers: headers}} when status in 200..299 ->
         {:ok, body, headers}
@@ -138,7 +139,8 @@ defmodule TitanFlow.WhatsApp.Client do
            headers: [
              {"Authorization", "Bearer #{access_token}"},
              {"Content-Type", "application/json"}
-           ]
+           ],
+           receive_timeout: 30_000
          ) do
       {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
         {:ok, body}

@@ -72,7 +72,9 @@ defmodule TitanFlow.Campaigns.BufferManager do
       phone_number_id: phone_number_id,
       last_contact_id: 0,  # Cursor for pagination
       total_pushed: 0,
-      is_exhausted: false  # True when no more contacts to push
+      is_exhausted: false,  # True when no more contacts to push
+      phone_index: Keyword.get(opts, :phone_index, 0),
+      total_phones: Keyword.get(opts, :total_phones, 1)
     }
     
     Logger.info("BufferManager started for campaign #{campaign_id}, phone #{phone_number_id}")
@@ -98,7 +100,7 @@ defmodule TitanFlow.Campaigns.BufferManager do
 
   @impl true
   def handle_call(:status, _from, state) do
-    {:ok, queue_size} = get_queue_size(state.phone_number_id)
+    {:ok, queue_size} = get_queue_size(state.phone_number_id, state.campaign_id)
     
     status = %{
       campaign_id: state.campaign_id,
@@ -115,7 +117,7 @@ defmodule TitanFlow.Campaigns.BufferManager do
   # Private Functions
 
   defp check_and_refill(state) do
-    {:ok, queue_size} = get_queue_size(state.phone_number_id)
+    {:ok, queue_size} = get_queue_size(state.phone_number_id, state.campaign_id)
     
     cond do
       queue_size >= @refill_threshold ->
@@ -131,22 +133,36 @@ defmodule TitanFlow.Campaigns.BufferManager do
 
   defp refill_buffer(state) do
     # Calculate how many to fetch
-    {:ok, current_size} = get_queue_size(state.phone_number_id)
+    {:ok, current_size} = get_queue_size(state.phone_number_id, state.campaign_id)
     space_available = @max_buffer - current_size
     fetch_count = min(space_available, @batch_size)
     
     if fetch_count <= 0 do
       state
     else
-      # Fetch contacts using cursor-based pagination
-      contacts = fetch_unsent_contacts(state.campaign_id, state.last_contact_id, fetch_count)
+      # Fetch contacts using cursor-based pagination with round-robin distribution
+      contacts = fetch_unsent_contacts(
+        state.campaign_id, 
+        state.last_contact_id, 
+        fetch_count,
+        state.phone_index,
+        state.total_phones
+      )
       
       if Enum.empty?(contacts) do
         Logger.info("BufferManager: No more contacts for campaign #{state.campaign_id}, marking exhausted")
+        
+        # Trigger completion check asynchronously (don't block BufferManager)
+        Task.start(fn ->
+          # Small delay to ensure last messages are sent
+          Process.sleep(5000)
+          TitanFlow.Campaigns.MessageTracking.check_campaign_completion(state.campaign_id)
+        end)
+        
         %{state | is_exhausted: true}
       else
         # Push to Redis
-        pushed = push_to_redis(contacts, state.phone_number_id)
+        pushed = push_to_redis(contacts, state.phone_number_id, state.campaign_id)
         new_last_id = contacts |> List.last() |> Map.get(:id)
         
         Logger.info("BufferManager: Pushed #{pushed} contacts, cursor now at #{new_last_id}")
@@ -159,9 +175,10 @@ defmodule TitanFlow.Campaigns.BufferManager do
     end
   end
 
-  defp fetch_unsent_contacts(campaign_id, after_id, limit) do
+  defp fetch_unsent_contacts(campaign_id, after_id, limit, phone_index, total_phones) do
     # Efficient cursor-based pagination
-    # Only fetch contacts that haven't been sent (not in message_logs)
+    # All BufferManagers fetch from same pool - cursor ensures no overlaps
+    # Duplicate protection via unique meta_message_id constraint prevents double-sends
     query = from c in "contacts",
       left_join: m in "message_logs", 
         on: m.contact_id == c.id and m.campaign_id == c.campaign_id,
@@ -181,8 +198,8 @@ defmodule TitanFlow.Campaigns.BufferManager do
     Repo.all(query)
   end
 
-  defp push_to_redis(contacts, phone_number_id) do
-    queue_name = "queue:sending:#{phone_number_id}"
+  defp push_to_redis(contacts, phone_number_id, campaign_id) do
+    queue_name = "queue:sending:#{campaign_id}:#{phone_number_id}"
     
     commands = Enum.map(contacts, fn contact ->
       payload = Jason.encode!(%{
@@ -202,8 +219,8 @@ defmodule TitanFlow.Campaigns.BufferManager do
     end
   end
 
-  defp get_queue_size(phone_number_id) do
-    queue_name = "queue:sending:#{phone_number_id}"
+  defp get_queue_size(phone_number_id, campaign_id) do
+    queue_name = "queue:sending:#{campaign_id}:#{phone_number_id}"
     Redix.command(:redix, ["LLEN", queue_name])
   end
 

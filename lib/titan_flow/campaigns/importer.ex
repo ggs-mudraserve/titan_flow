@@ -275,18 +275,16 @@ defmodule TitanFlow.Campaigns.Importer do
     case System.cmd("unzip", ["-l", path], stderr_to_stdout: true) do
       {output, 0} ->
         # Parse unzip -l output to find .csv files
+        # Output format: "  Length      Date    Time    Name"
+        # Example line: "   707919  2025-12-16 08:02   tata 16 Dec_vid.csv"
         output
         |> String.split("\n")
         |> Enum.find_value(fn line ->
-          if String.contains?(line, ".csv") do
-            # Extract filename from line (last column)
-            line
-            |> String.split()
-            |> List.last()
-            |> case do
-              nil -> nil
-              name -> if String.ends_with?(name, ".csv"), do: name, else: nil
-            end
+          # Use regex to extract filename (everything after the time field)
+          # Pattern: capture everything after "HH:MM   " until end of line
+          case Regex.run(~r/\d{2}:\d{2}\s+(.+\.csv)\s*$/i, line) do
+            [_, filename] -> String.trim(filename)
+            _ -> nil
           end
         end)
         

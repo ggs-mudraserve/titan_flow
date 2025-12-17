@@ -282,7 +282,7 @@ defmodule TitanFlowWeb.CampaignsLive do
   @impl true
   def handle_info(:tick, socket) do
     if socket.assigns.selected_campaign do
-      Process.send_after(self(), :tick, 2000)
+      Process.send_after(self(), :tick, 5000)  # 5 second polling interval
       
       # Reload campaign to check for status updates / timestamps
       campaign_id = socket.assigns.selected_campaign.id
@@ -290,24 +290,26 @@ defmodule TitanFlowWeb.CampaignsLive do
       
       new_stats = TitanFlow.Campaigns.MessageTracking.get_realtime_stats(campaign_id)
       
-      template_stats = if campaign.status == "completed" do
-         # Only fetch if we haven't already or if it just completed
-         socket.assigns[:template_stats] || TitanFlow.Campaigns.MessageTracking.get_template_breakdown(campaign.id)
+      # Only fetch template_stats once when campaign completes (not on every tick)
+      template_stats = if campaign.status == "completed" and socket.assigns[:template_stats] == nil do
+         TitanFlow.Campaigns.MessageTracking.get_template_breakdown(campaign.id)
       else
-         nil
+         socket.assigns[:template_stats]
       end
       
-      # Calculate MPS
+      # Calculate MPS based on 5 second interval
       old_sent = socket.assigns.live_stats.sent_count || 0
       new_sent = new_stats.sent_count || 0
-      # 2 second interval
-      mps = max(0.0, (new_sent - old_sent) / 2.0)
+      mps = max(0.0, (new_sent - old_sent) / 5.0)
       
+      # MEMORY OPTIMIZATION: Don't reload failed_messages on every tick
+      # Keep the initial list that was loaded when modal opened
       {:noreply, assign(socket, 
          selected_campaign: campaign,
          live_stats: new_stats, 
          template_stats: template_stats,
          current_mps: mps
+         # failed_messages intentionally NOT updated - stays from initial load
       )}
     else
       {:noreply, socket}
@@ -442,14 +444,19 @@ defmodule TitanFlowWeb.CampaignsLive do
           <!-- Deduplication Notice -->
           <%= if @campaign.skipped_count && @campaign.skipped_count > 0 do %>
             <div class="bg-amber-500/10 rounded-lg p-4 border border-amber-500/30">
-              <div class="flex items-center gap-2">
-                <span class="text-amber-400">📋</span>
-                <span class="text-sm font-medium text-amber-300">
-                  Verified List: <span class="font-bold font-mono"><%= @campaign.total_records %></span>
-                  <span class="text-amber-400/80">
-                    (<%= @campaign.skipped_count %> removed based on <%= @campaign.dedup_window_days %>-day history)
-                  </span>
-                </span>
+              <div class="flex items-start gap-3">
+                <span class="text-amber-400 text-lg">⚠️</span>
+                <div class="flex-1">
+                  <div class="text-sm font-medium text-amber-300 mb-1">
+                    <span class="font-bold font-mono text-base"><%= @campaign.skipped_count %></span> Duplicate Contacts Removed
+                  </div>
+                  <div class="text-xs text-amber-400/80">
+                    These numbers were already contacted within the last <%= @campaign.dedup_window_days %> day<%= if @campaign.dedup_window_days > 1, do: "s", else: "" %> and excluded from this campaign.
+                  </div>
+                  <div class="text-xs text-amber-300/70 mt-1.5">
+                    Final contact list: <span class="font-mono font-medium"><%= @campaign.total_records %></span> contacts
+                  </div>
+                </div>
               </div>
             </div>
           <% end %>

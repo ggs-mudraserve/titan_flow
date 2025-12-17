@@ -342,12 +342,62 @@ defmodule TitanFlow.Campaigns.MessageTracking do
       total_processed = (campaign.sent_count || 0) + (campaign.failed_count || 0)
       total_records = campaign.total_records || 0
 
-      if total_processed >= total_records and total_records > 0 do
-        Logger.info("Campaign #{campaign_id} completed: #{total_processed}/#{total_records} processed")
+      # Check completion conditions: count-based OR buffer-based
+      count_based = total_processed >= total_records and total_records > 0
+      buffer_based = all_buffers_exhausted?(campaign)
+      
+      # Safety check: Don't auto-complete campaigns with zero messages sent
+      # (prevents completing campaigns where all contacts are blacklisted/filtered)
+      has_sent_messages = total_processed > 0
+      
+      if (count_based or buffer_based) and has_sent_messages do
+        reason = cond do
+          count_based and buffer_based -> 
+            "all messages processed AND all buffers exhausted"
+          count_based -> 
+            "#{total_processed}/#{total_records} processed"
+          buffer_based -> 
+            "all BufferManagers exhausted (#{total_processed}/#{total_records} processed)"
+        end
+        
+        Logger.info("Campaign #{campaign_id} completed: #{reason}")
         Campaigns.update_campaign(campaign, %{status: "completed", completed_at: NaiveDateTime.utc_now()})
       else
+        if buffer_based and not has_sent_messages do
+          # BufferManagers exhausted but zero messages sent - likely all filtered/blacklisted
+          Logger.warning("Campaign #{campaign_id}: BufferManagers exhausted but 0 messages sent (#{total_records} contacts in DB, likely all filtered/blacklisted)")
+        end
         {:ok, campaign}
       end
+    end
+  end
+  
+  defp all_buffers_exhausted?(campaign) do
+    # Get all phone numbers for this campaign
+    phone_ids = case campaign.senders_config do
+      nil -> campaign.phone_ids || []
+      config when is_list(config) -> 
+        Enum.map(config, fn c -> c["phone_id"] end)
+      _ -> campaign.phone_ids || []
+    end
+    
+    if Enum.empty?(phone_ids) do
+      false  # No phones configured = not exhausted
+    else
+      # Check if ALL BufferManagers are exhausted
+      Enum.all?(phone_ids, fn phone_id ->
+        # Get phone_number_id from database
+        case TitanFlow.WhatsApp.get_phone_number!(phone_id) do
+          nil -> true  # Phone not found = consider exhausted
+          phone ->
+            # Check BufferManager status
+            case TitanFlow.Campaigns.BufferManager.status(campaign.id, phone.phone_number_id) do
+              {:ok, %{is_exhausted: true}} -> true
+              {:error, :not_running} -> true  # Not running = consider exhausted
+              _ -> false  # Still running and not exhausted
+            end
+        end
+      end)
     end
   end
 

@@ -9,7 +9,11 @@ import Config
 
 config :titan_flow,
   ecto_repos: [TitanFlow.Repo],
-  generators: [timestamp_type: :utc_datetime]
+  generators: [timestamp_type: :naive_datetime]
+
+# Feature Flags - Easy rollback by setting to false
+config :titan_flow, :features,
+  use_fast_importer: true  # ENABLED: Using 10x faster PostgreSQL COPY importer
 
 # Configure the endpoint
 config :titan_flow, TitanFlowWeb.Endpoint,

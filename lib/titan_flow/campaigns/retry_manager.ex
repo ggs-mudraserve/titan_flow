@@ -166,7 +166,7 @@ defmodule TitanFlow.Campaigns.RetryManager do
       "retry_count" => retry_count
     })
     
-    queue_name = "queue:sending:#{active_phone_id}"
+    queue_name = "queue:sending:#{campaign_id}:#{active_phone_id}"
     
     case Redix.command(:redix, ["RPUSH", queue_name, payload]) do
       {:ok, _} ->

@@ -41,7 +41,12 @@ defmodule TitanFlow.Campaigns.Pipeline do
       Application.get_env(:titan_flow, :redix)
     end)
 
-    queue_name = "queue:sending:#{phone_number_id}"
+    queue_name = "queue:sending:#{campaign_id}:#{phone_number_id}"
+    
+    # Load templates into cache once at startup (eliminates DB queries during campaign)
+    templates_cache = load_templates_into_cache(template_ids)
+    require Logger
+    Logger.info("Pipeline: Loaded #{map_size(templates_cache)} templates into cache for phone #{phone_number_id}")
 
     Broadway.start_link(__MODULE__,
       name: via_tuple(phone_number_id),
@@ -56,14 +61,16 @@ defmodule TitanFlow.Campaigns.Pipeline do
       ],
       processors: [
         default: [
-          concurrency: 200
+          concurrency: 25  # Reduced from 200 to prevent DB pool exhaustion (18 connections)
         ]
       ],
       context: %{
         phone_number_id: phone_number_id,
         campaign_id: campaign_id,
         # List of template IDs assigned to this phone
-        template_ids: template_ids
+        template_ids: template_ids,
+        # Cache: template_id => %{name, language} (loaded once, no DB queries during campaign)
+        templates_cache: templates_cache
       }
     )
   end
@@ -92,13 +99,19 @@ defmodule TitanFlow.Campaigns.Pipeline do
     %{
       phone_number_id: phone_number_id,
       campaign_id: campaign_id,
-      template_ids: template_ids
+      template_ids: template_ids,
+      templates_cache: templates_cache
     } = context
+
+    require Logger
+    Logger.info("Pipeline: Processing message for campaign #{campaign_id}, phone #{phone_number_id}")
+    Logger.debug("Pipeline: Data = #{data}")
 
     # Check if campaign is paused - if so, re-queue safely
     if Orchestrator.is_paused?(campaign_id) do
+      Logger.info("Pipeline: Campaign #{campaign_id} is paused, requeuing")
       # Re-queue the message back to Redis (at the tail)
-      requeue_message(phone_number_id, data)
+      requeue_message(campaign_id, phone_number_id, data)
       # Sleep to prevent hot loop
       Process.sleep(5000)
       # Acknowledge to Broadway (don't fail - that causes data loss)
@@ -106,29 +119,31 @@ defmodule TitanFlow.Campaigns.Pipeline do
     else
       # Check if this phone is exhausted (payment errors)
       try do
+        Logger.debug("Pipeline: Checking valid phone for campaign #{campaign_id}")
         case get_valid_phone(campaign_id, phone_number_id) do
           {:ok, active_phone_id} ->
-            # Get contact_id from message data for template rotation
-            contact_id = case Jason.decode(data) do
-              {:ok, payload} -> payload["contact_id"] || 0
-              _ -> 0
-            end
-            
-            # Use contact_id for deterministic template selection (round-robin per contact)
-            # This ensures consistent template selection even after pipeline restarts
-            {template_name, language_code} = get_template_for_phone(template_ids, contact_id)
-
+            Logger.debug("Pipeline: Phone #{active_phone_id} is valid, decoding payload")
             case Jason.decode(data) do
               {:ok, payload} ->
-                # Wrap in try/rescue to handle unexpected errors gracefully
-                try do
-                  dispatch_with_retry(message, payload, active_phone_id, campaign_id, template_name, language_code, 0)
-                rescue
-                  e ->
-                    require Logger
-                    Logger.error("Dispatch error for #{payload["phone"]}: #{inspect(e)}")
-                    # Skip this message but don't crash the pipeline
-                    message
+                Logger.info("Pipeline: Decoded payload for contact_id=#{payload["contact_id"]}, phone=#{payload["phone"]}")
+                # NEW: Try templates with intelligent fallback
+                # Get healthy templates (filter out those that failed for this phone)
+                Logger.debug("Pipeline: Getting healthy templates from #{inspect(template_ids)}")
+                healthy_templates = get_healthy_templates(campaign_id, active_phone_id, template_ids)
+                Logger.info("Pipeline: Healthy templates count: #{length(healthy_templates)}")
+                
+                if Enum.empty?(healthy_templates) do
+                  # All templates exhausted for this phone - mark phone as exhausted
+                  require Logger
+                  Logger.error("All templates exhausted for phone #{active_phone_id} in campaign #{campaign_id}")
+                  mark_phone_exhausted(campaign_id, active_phone_id)
+                  Message.failed(message, "All templates exhausted for this phone")
+                else
+                  # Try sending with fallback logic (pass cache for fast lookups)
+                  Logger.info("Pipeline: Attempting to send with #{length(healthy_templates)} templates")
+                  result = try_send_with_template_fallback(message, payload, active_phone_id, campaign_id, healthy_templates, 0, templates_cache)
+                  Logger.info("Pipeline: Send result = #{inspect(result)}")
+                  result
                 end
 
               {:error, _reason} ->
@@ -138,7 +153,7 @@ defmodule TitanFlow.Campaigns.Pipeline do
           {:error, :all_phones_exhausted} ->
             # All phones exhausted - pause and re-queue
             Orchestrator.pause_campaign(campaign_id)
-            requeue_message(phone_number_id, data)
+            requeue_message(campaign_id, phone_number_id, data)
             message
         end
       catch
@@ -190,43 +205,218 @@ defmodule TitanFlow.Campaigns.Pipeline do
     end
   end
 
-  defp requeue_message(phone_number_id, data) do
-    queue_name = "queue:sending:#{phone_number_id}"
+  # Load templates into memory cache at startup (eliminates DB queries during campaign)
+  # This is CRITICAL for DB performance - must succeed to avoid 100s of queries/sec
+  defp load_templates_into_cache(template_ids) when is_list(template_ids) and length(template_ids) > 0 do
+    require Logger
+    
+    try do
+      # Use batch query instead of individual gets for better reliability
+      import Ecto.Query
+      templates = TitanFlow.Repo.all(
+        from t in TitanFlow.Templates.Template,
+        where: t.id in ^template_ids,
+        select: %{id: t.id, name: t.name, language: t.language}
+      )
+      
+      # Build cache map
+      cache = templates
+      |> Enum.map(fn t -> 
+        {t.id, %{name: t.name, language: t.language || "en"}} 
+      end)
+      |> Map.new()
+      
+      # Verify all templates were loaded
+      missing = template_ids -- Map.keys(cache)
+      if length(missing) > 0 do
+        Logger.error("Template cache INCOMPLETE: Missing template IDs #{inspect(missing)}")
+        Logger.error("Requested: #{inspect(template_ids)}, Loaded: #{inspect(Map.keys(cache))}")
+      else
+        Logger.info("Template cache loaded successfully: #{map_size(cache)} templates cached")
+      end
+      
+      cache
+    rescue
+      e ->
+        Logger.error("CRITICAL: Failed to load templates into cache!")
+        Logger.error("Error: #{inspect(e)}")
+        Logger.error("Template IDs: #{inspect(template_ids)}")
+        Logger.error("This will cause DB overload - Pipeline will query DB for each message")
+        
+        # Return empty map - Pipeline will fall back to DB queries (slow but works)
+        %{}
+    end
+  end
+  
+  defp load_templates_into_cache([]) do
+    require Logger
+    Logger.warning("No template IDs provided for cache - this campaign has no templates!")
+    %{}
+  end
+
+  defp requeue_message(campaign_id, phone_number_id, data) do
+    queue_name = "queue:sending:#{campaign_id}:#{phone_number_id}"
     Redix.command(:redix, ["RPUSH", queue_name, data])
   end
 
   # Private Functions
 
-  defp get_template_for_phone(template_ids, contact_id) when length(template_ids) > 0 do
-    # Use contact_id modulo template count for deterministic round-robin
-    # This ensures: contact 1 -> template #0, contact 2 -> template #1, etc.
-    # Benefits: Stateless, survives pipeline restarts, distributes templates evenly
-    template_index = rem(contact_id, length(template_ids))
-    template_id = Enum.at(template_ids, template_index)
+  # Get templates that haven't failed for this phone in this campaign
+  defp get_healthy_templates(campaign_id, phone_number_id, template_ids) do
+    key = "campaign:#{campaign_id}:phone:#{phone_number_id}:failed_templates"
     
-    # Fetch template from database
-    template = TitanFlow.Templates.get_template!(template_id)
-    
-    {template.name, template.language || "en"}
+    case Redix.command(:redix, ["SMEMBERS", key]) do
+      {:ok, failed_template_ids} ->
+        # Convert failed IDs from strings to integers
+        failed_ids = Enum.map(failed_template_ids, fn id_str ->
+          case Integer.parse(id_str) do
+            {id, _} -> id
+            :error -> nil
+          end
+        end) |> Enum.reject(&is_nil/1)
+        
+        # Filter out failed templates
+        Enum.reject(template_ids, fn tid -> tid in failed_ids end)
+      
+      _ ->
+        # Redis error - return all templates (fail-safe)
+        template_ids
+    end
   end
-  defp get_template_for_phone([], _contact_id) do
-    # No templates configured - this shouldn't happen but provide fallback
+  
+  # Mark a template as failed/exhausted for a specific phone in a campaign
+  defp mark_template_exhausted(campaign_id, phone_number_id, template_id, error_code) do
+    key = "campaign:#{campaign_id}:phone:#{phone_number_id}:failed_templates"
+    Redix.command(:redix, ["SADD", key, to_string(template_id)])
+    
     require Logger
-    Logger.error("No templates configured for this phone")
-    {"default", "en"}
+    Logger.warning("Template #{template_id} marked as exhausted for phone #{phone_number_id} in campaign #{campaign_id} (error: #{error_code})")
+  end
+  
+  # Mark entire phone as exhausted (all templates failed)
+  defp mark_phone_exhausted(campaign_id, phone_number_id) do
+    # Mark phone as exhausted in Redis
+    Redix.command(:redix, ["SADD", "campaign:#{campaign_id}:exhausted_phones", phone_number_id])
+    
+    # Check if ALL phones are now exhausted
+    {:ok, exhausted_phones} = Redix.command(:redix, ["SMEMBERS", "campaign:#{campaign_id}:exhausted_phones"])
+    
+    # Get campaign to check total phone count
+    campaign = TitanFlow.Campaigns.get_campaign!(campaign_id)
+    total_phones = length(campaign.phone_ids || [])
+    
+    if length(exhausted_phones) >= total_phones do
+      # All phones exhausted - pause campaign with message
+      require Logger
+      Logger.error("All #{total_phones} phones exhausted for campaign #{campaign_id} - pausing")
+      
+      Orchestrator.pause_campaign(campaign_id)
+      TitanFlow.Campaigns.update_campaign(campaign, %{
+        error_message: "All numbers exhausted"
+      })
+    end
+  end
+  
+  # Try sending with template fallback - sequentially tries each healthy template
+  defp try_send_with_template_fallback(message, _payload, _phone_number_id, _campaign_id, [], _attempt, _templates_cache) do
+    # No more templates to try
+    Message.failed(message, "All templates failed")
+  end
+  
+  defp try_send_with_template_fallback(message, payload, phone_number_id, campaign_id, [template_id | remaining_templates], attempt, templates_cache) do
+    require Logger
+    Logger.info("Pipeline: Trying template #{template_id}, attempt #{attempt}, remaining: #{length(remaining_templates)}")
+    
+    # Get template from cache (0ms lookup vs ~5-10ms DB query)
+    {template_name, language} = case Map.get(templates_cache, template_id) do
+      nil ->
+        # Template not in cache (shouldn't happen) - fall back to DB for safety
+        Logger.warning("Template #{template_id} not in cache, fetching from DB (fallback)")
+        template = TitanFlow.Templates.get_template!(template_id)
+        {template.name, template.language || "en"}
+        
+      cached_template ->
+        # Use cached template data (fast!)
+        {cached_template.name, cached_template.language}
+    end
+    
+    Logger.debug("Pipeline: Using template: #{template_name}, language: #{language}")
+    
+    # Try sending with this template
+    Logger.info("Pipeline: Calling dispatch_with_retry for template #{template_name}")
+    result = dispatch_with_retry(message, payload, phone_number_id, campaign_id, template_name, language, 0)
+    Logger.info("Pipeline: dispatch_with_retry returned: #{inspect(result)}")
+    
+    # Check if we should try the next template
+    case result do
+      %Broadway.Message{status: {:failed, reason}} ->
+        # Check if this was a template-specific error that warrants fallback
+        if should_try_next_template?(reason, template_id, campaign_id, phone_number_id) do
+          require Logger
+          Logger.info("Template #{template_id} failed with retriable error, trying next template (#{length(remaining_templates)} remaining)")
+          
+          # Try next template (pass cache through)
+          try_send_with_template_fallback(message, payload, phone_number_id, campaign_id, remaining_templates, attempt + 1, templates_cache)
+        else
+          # Non-retriable error, return failure
+          result
+        end
+      
+      _ ->
+        # Success or other status
+        result
+    end
+  end
+  
+  # Determine if we should try the next template based on the error
+  defp should_try_next_template?(reason, template_id, campaign_id, phone_number_id) do
+    case reason do
+      "API error " <> rest ->
+        # Extract error code from reason string
+        cond do
+          String.contains?(rest, "132000") ->
+            mark_template_exhausted(campaign_id, phone_number_id, template_id, "132000")
+            true
+          
+          String.contains?(rest, "132015") ->
+            mark_template_exhausted(campaign_id, phone_number_id, template_id, "132015")
+            true
+          
+          String.contains?(rest, "132016") ->
+            mark_template_exhausted(campaign_id, phone_number_id, template_id, "132016")
+            true
+          
+          String.contains?(rest, "132001") ->
+            mark_template_exhausted(campaign_id, phone_number_id, template_id, "132001")
+            true
+          
+          true ->
+            # Other API errors don't warrant template fallback
+            false
+        end
+      
+      _ ->
+        false
+    end
   end
 
   defp dispatch_with_retry(message, payload, phone_number_id, campaign_id, template_name, language_code, retry_count) do
     alias TitanFlow.Campaigns.MessageTracking
     alias TitanFlow.WhatsApp.Client
     
+    require Logger
+    Logger.debug("Pipeline: dispatch_with_retry called - template: #{template_name}, retry: #{retry_count}")
+    
     # Step 1: Check rate limit (fast, non-blocking)
+    Logger.debug("Pipeline: Checking rate limit for phone #{phone_number_id}")
     case RateLimiter.dispatch(phone_number_id, nil) do
       {:ok, :allowed, access_token} ->
+        Logger.info("Pipeline: Rate limit OK, sending to WhatsApp API")
         # Step 2: Make HTTP call directly (parallel with 50 processors)
         components = build_components(payload)
         credentials = %{access_token: access_token, phone_number_id: phone_number_id}
         
+        Logger.debug("Pipeline: Calling Client.send_template for #{payload["phone"]}")
         result = Client.send_template(
           payload["phone"],
           template_name,
@@ -234,6 +424,7 @@ defmodule TitanFlow.Campaigns.Pipeline do
           components,
           credentials
         )
+        Logger.info("Pipeline: Client.send_template returned: #{inspect(elem(result, 0))}")
         
         case result do
           {:ok, body, headers} ->

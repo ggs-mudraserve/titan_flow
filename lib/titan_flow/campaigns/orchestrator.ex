@@ -73,13 +73,36 @@ defmodule TitanFlow.Campaigns.Orchestrator do
     phone_template_map = build_phone_template_map(campaign, phone_ids, template_ids)
     
     # Step 1: Import CSV if provided
-    if csv_path do
+    import_count = if csv_path do
       Logger.info("Campaign #{campaign.id}: Starting CSV import from #{csv_path}")
-      {:ok, import_count} = Importer.import_csv(csv_path, campaign.id)
-      Logger.info("Campaign #{campaign.id}: Imported #{import_count} contacts")
-      Campaigns.update_campaign(campaign, %{total_records: import_count})
       
-      # Step 1b: Apply deduplication (remove recently contacted)
+      # Check feature flag for fast importer
+      use_fast = Application.get_env(:titan_flow, :features, [])[:use_fast_importer] || false
+      
+      import_result = if use_fast do
+        Logger.info("Campaign #{campaign.id}: Using FastImporter (PostgreSQL COPY)")
+        TitanFlow.Campaigns.FastImporter.import_csv(csv_path, campaign.id)
+      else
+        Logger.info("Campaign #{campaign.id}: Using legacy Importer")
+        Importer.import_csv(csv_path, campaign.id)
+      end
+      
+      case import_result do
+        {:ok, count} ->
+          Logger.info("Campaign #{campaign.id}: Imported #{count} contacts")
+          Campaigns.update_campaign(campaign, %{total_records: count})
+          count
+        
+        {:error, reason} ->
+          Logger.error("Campaign #{campaign.id}: Import failed: #{inspect(reason)}")
+          raise "CSV import failed: #{inspect(reason)}"
+      end
+    else
+      0
+    end
+    
+    # Step 1b: Apply deduplication (remove recently contacted)
+    if import_count > 0 do
       alias TitanFlow.Campaigns.Sanitizer
       {:ok, skipped_count} = Sanitizer.apply_deduplication(campaign.id)
       
@@ -94,7 +117,10 @@ defmodule TitanFlow.Campaigns.Orchestrator do
     # Step 2: Start BufferManagers (JIT queue strategy - NO bulk push)
     Logger.info("Campaign #{campaign.id}: Starting JIT BufferManagers for #{length(phones)} phones")
     
-    Enum.each(phones, fn phone ->
+    total_phones = length(phones)
+    phones
+    |> Enum.with_index()
+    |> Enum.each(fn {phone, phone_index} ->
       # Get template IDs for this specific phone
       phone_template_ids = Map.get(phone_template_map, phone.id, [])
       
@@ -112,29 +138,43 @@ defmodule TitanFlow.Campaigns.Orchestrator do
           Logger.error("Campaign #{campaign.id}: Failed to start rate limiter for phone #{phone.phone_number_id}: #{inspect(reason)}")
       end
       
-      # Start BufferManager (JIT queue feeder)
+      # Start BufferManager (JIT queue feeder) with round-robin distribution
       case DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
         BufferManager,
         campaign_id: campaign.id,
-        phone_number_id: phone.phone_number_id
+        phone_number_id: phone.phone_number_id,
+        phone_index: phone_index,
+        total_phones: total_phones
       }) do
         {:ok, pid} ->
-          Logger.info("Campaign #{campaign.id}: BufferManager started #{inspect(pid)} for phone #{phone.phone_number_id}")
+          Logger.info("Campaign #{campaign.id}: BufferManager started #{inspect(pid)} for phone #{phone.phone_number_id} (index #{phone_index}/#{total_phones})")
         {:error, {:already_started, _}} ->
           Logger.info("Campaign #{campaign.id}: BufferManager already running for phone #{phone.phone_number_id}")
         {:error, reason} ->
-          raise "Failed to start BufferManager: #{inspect(reason)}"
+          raise "Failed to start BufferManager: #{inspect(reason)}" 
       end
       
       # Start Broadway pipeline with phone-specific template IDs
       Logger.info("Campaign #{campaign.id}: Starting pipeline for phone #{phone.phone_number_id} with templates #{inspect(phone_template_ids)}")
-      case Pipeline.start_link(
-        phone_number_id: phone.phone_number_id,
-        campaign_id: campaign.id,
-        template_ids: phone_template_ids
-      ) do
+      
+      # Start under supervision with auto-restart on crash
+      pipeline_spec = %{
+        id: {:pipeline, phone.phone_number_id},
+        start: {Pipeline, :start_link, [
+          [
+            phone_number_id: phone.phone_number_id,
+            campaign_id: campaign.id,
+            template_ids: phone_template_ids
+          ]
+        ]},
+        restart: :permanent  # ALWAYS restart - prevents speed drops to 0
+      }
+      
+      case DynamicSupervisor.start_child(TitanFlow.Campaigns.PipelineSupervisor, pipeline_spec) do
         {:ok, pid} ->
-          Logger.info("Campaign #{campaign.id}: Pipeline started #{inspect(pid)}")
+          Logger.info("Campaign #{campaign.id}: Pipeline started under supervision #{inspect(pid)}")
+        {:error, {:already_started, pid}} ->
+          Logger.info("Campaign #{campaign.id}: Pipeline already running #{inspect(pid)}")
         {:error, reason} ->
           Logger.error("Campaign #{campaign.id}: Failed to start pipeline: #{inspect(reason)}")
       end
@@ -229,7 +269,10 @@ defmodule TitanFlow.Campaigns.Orchestrator do
       campaign.template_ids || []
     )
     
-    Enum.each(phones, fn phone ->
+    total_phones = length(phones)
+    phones
+    |> Enum.with_index()
+    |> Enum.each(fn {phone, phone_index} ->
       # Get template IDs for this specific phone
       phone_template_ids = Map.get(phone_template_map, phone.id, [])
       
@@ -243,7 +286,9 @@ defmodule TitanFlow.Campaigns.Orchestrator do
           case DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
             BufferManager,
             campaign_id: campaign.id,
-            phone_number_id: phone.phone_number_id
+            phone_number_id: phone.phone_number_id,
+            phone_index: phone_index,
+            total_phones: total_phones
           }) do
             {:ok, pid} ->
               Logger.info("Campaign #{campaign.id}: Restarted BufferManager for phone #{phone.phone_number_id} - #{inspect(pid)}")
@@ -259,13 +304,25 @@ defmodule TitanFlow.Campaigns.Orchestrator do
       # Check if Pipeline already exists
       case Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone.phone_number_id) do
         [] ->
-          # Start Pipeline with phone-specific template IDs
-          {:ok, pid} = Pipeline.start_link(
-            phone_number_id: phone.phone_number_id,
-            campaign_id: campaign.id,
-            template_ids: phone_template_ids
-          )
-          Logger.info("Campaign #{campaign.id}: Restarted pipeline for phone #{phone.phone_number_id} - #{inspect(pid)}")
+          # Start Pipeline with phone-specific template IDs under supervision
+          pipeline_spec = %{
+            id: {:pipeline, phone.phone_number_id},
+            start: {Pipeline, :start_link, [
+              [
+                phone_number_id: phone.phone_number_id,
+                campaign_id: campaign.id,
+                template_ids: phone_template_ids
+              ]
+            ]},
+            restart: :permanent  # ALWAYS restart
+          }
+          
+          case DynamicSupervisor.start_child(TitanFlow.Campaigns.PipelineSupervisor, pipeline_spec) do
+            {:ok, pid} ->
+              Logger.info("Campaign #{campaign.id}: Restarted pipeline under supervision for phone #{phone.phone_number_id} - #{inspect(pid)}")
+            {:error, reason} ->
+              Logger.error("Campaign #{campaign.id}: Failed to restart pipeline: #{inspect(reason)}")
+          end
         _ ->
           Logger.info("Campaign #{campaign.id}: Pipeline already running for phone #{phone.phone_number_id}")
       end

@@ -214,21 +214,27 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
   defp analyze_and_adjust(headers, state) do
     rate_info = Client.parse_rate_limit_headers(headers)
     remaining = rate_info.remaining
+    
+    # DEBUG: Log rate limit info
+    require Logger
+    Logger.info("Rate Limit [Phone #{state.phone_number_id}]: remaining=#{inspect(remaining)}, limit=#{inspect(rate_info.limit)}, current_mps=#{state.current_mps}")
 
     cond do
       is_nil(remaining) ->
         state
 
-      # Brake (Safety): Remaining < 20%
+      # Brake (Safety): Remaining < 20
       remaining < 20 ->
         # Decrease concurrency immediately
         new_mps = max(state.current_mps - @throttle_down_amount, @min_mps)
+        Logger.warning("Throttling DOWN: #{state.current_mps} -> #{new_mps} (remaining: #{remaining})")
         %{state | current_mps: new_mps}
 
-      # Accelerator (Speed): Remaining > 80%
+      # Accelerator (Speed): Remaining > 80
       # Note: We should ideally also check if our queue is full, but strictly based on headers:
       remaining > 80 ->
         new_mps = min(state.current_mps + @throttle_up_amount, @max_mps)
+        Logger.info("Throttling UP: #{state.current_mps} -> #{new_mps} (remaining: #{remaining})")
         %{state | current_mps: new_mps}
 
       true ->

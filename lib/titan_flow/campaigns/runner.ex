@@ -51,7 +51,7 @@ defmodule TitanFlow.Campaigns.Runner do
             phone_index = rem(batch_index, length(phone_number_ids))
             phone_number_id = Enum.at(phone_number_ids, phone_index)
             
-            queued = push_batch_to_redis(conn, phone_number_id, batch)
+            queued = push_batch_to_redis(conn, campaign_id, phone_number_id, batch)
             acc + queued
           end)
         end, timeout: :infinity)
@@ -65,9 +65,11 @@ defmodule TitanFlow.Campaigns.Runner do
 
   @doc """
   Get the queue length for a sender phone number.
+  NOTE: This function needs campaign_id to work with new queue format.
+  This module is DEPRECATED -  BufferManager is used instead.
   """
-  @spec queue_length(String.t()) :: {:ok, integer()} | {:error, term()}
-  def queue_length(phone_number_id) do
+  @spec queue_length(integer(), String.t()) :: {:ok, integer()} | {:error, term()}
+  def queue_length(campaign_id, phone_number_id) do
     redix_config = Application.get_env(:titan_flow, :redix)
     
     {:ok, conn} = Redix.start_link(
@@ -77,7 +79,7 @@ defmodule TitanFlow.Campaigns.Runner do
     )
 
     try do
-      queue_name = queue_key(phone_number_id)
+      queue_name = queue_key(campaign_id, phone_number_id)
       {:ok, length} = Redix.command(conn, ["LLEN", queue_name])
       {:ok, length}
     after
@@ -109,7 +111,7 @@ defmodule TitanFlow.Campaigns.Runner do
         |> stream_missing_contacts()
         |> Stream.chunk_every(@batch_size)
         |> Enum.reduce(0, fn batch, acc ->
-          queued = push_batch_to_redis(conn, phone_number_id, batch)
+          queued = push_batch_to_redis(conn, campaign_id, phone_number_id, batch)
           Logger.info("Runner: Queued #{queued} missing contacts")
           acc + queued
         end)
@@ -156,8 +158,8 @@ defmodule TitanFlow.Campaigns.Runner do
     Repo.stream(query, max_rows: @batch_size)
   end
 
-  defp push_batch_to_redis(conn, phone_number_id, contacts) do
-    queue_name = queue_key(phone_number_id)
+  defp push_batch_to_redis(conn, campaign_id, phone_number_id, contacts) do
+    queue_name = queue_key(campaign_id, phone_number_id)
 
     # Build pipeline of RPUSH commands
     commands =
@@ -185,7 +187,8 @@ defmodule TitanFlow.Campaigns.Runner do
     end
   end
 
-  defp queue_key(phone_number_id) do
-    "queue:sending:#{phone_number_id}"
+  defp queue_key(campaign_id, phone_number_id) do
+    "queue:sending:#{campaign_id}:#{phone_number_id}"
   end
 end
+
