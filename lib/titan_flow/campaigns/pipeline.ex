@@ -61,7 +61,7 @@ defmodule TitanFlow.Campaigns.Pipeline do
       ],
       processors: [
         default: [
-          concurrency: 25  # Reduced from 200 to prevent DB pool exhaustion (18 connections)
+          concurrency: 10  # High Performance: 10 × 2 phones = 20 workers. Finch pool handles network, Supavisor handles DB.
         ]
       ],
       context: %{
@@ -103,13 +103,11 @@ defmodule TitanFlow.Campaigns.Pipeline do
       templates_cache: templates_cache
     } = context
 
-    require Logger
-    Logger.info("Pipeline: Processing message for campaign #{campaign_id}, phone #{phone_number_id}")
-    Logger.debug("Pipeline: Data = #{data}")
+    # Removed verbose logging for performance
 
     # Check if campaign is paused - if so, re-queue safely
     if Orchestrator.is_paused?(campaign_id) do
-      Logger.info("Pipeline: Campaign #{campaign_id} is paused, requeuing")
+      # Campaign paused - requeue silently
       # Re-queue the message back to Redis (at the tail)
       requeue_message(campaign_id, phone_number_id, data)
       # Sleep to prevent hot loop
@@ -117,93 +115,59 @@ defmodule TitanFlow.Campaigns.Pipeline do
       # Acknowledge to Broadway (don't fail - that causes data loss)
       message
     else
-      # Check if this phone is exhausted (payment errors)
-      try do
-        Logger.debug("Pipeline: Checking valid phone for campaign #{campaign_id}")
-        case get_valid_phone(campaign_id, phone_number_id) do
-          {:ok, active_phone_id} ->
-            Logger.debug("Pipeline: Phone #{active_phone_id} is valid, decoding payload")
-            case Jason.decode(data) do
-              {:ok, payload} ->
-                Logger.info("Pipeline: Decoded payload for contact_id=#{payload["contact_id"]}, phone=#{payload["phone"]}")
-                # NEW: Try templates with intelligent fallback
-                # Get healthy templates (filter out those that failed for this phone)
-                Logger.debug("Pipeline: Getting healthy templates from #{inspect(template_ids)}")
-                healthy_templates = get_healthy_templates(campaign_id, active_phone_id, template_ids)
-                Logger.info("Pipeline: Healthy templates count: #{length(healthy_templates)}")
-                
-                if Enum.empty?(healthy_templates) do
-                  # All templates exhausted for this phone - mark phone as exhausted
-                  require Logger
-                  Logger.error("All templates exhausted for phone #{active_phone_id} in campaign #{campaign_id}")
-                  mark_phone_exhausted(campaign_id, active_phone_id)
-                  Message.failed(message, "All templates exhausted for this phone")
-                else
-                  # Try sending with fallback logic (pass cache for fast lookups)
-                  Logger.info("Pipeline: Attempting to send with #{length(healthy_templates)} templates")
-                  result = try_send_with_template_fallback(message, payload, active_phone_id, campaign_id, healthy_templates, 0, templates_cache)
-                  Logger.info("Pipeline: Send result = #{inspect(result)}")
-                  result
-                end
-
-              {:error, _reason} ->
-                Message.failed(message, "Invalid JSON payload")
+      # Check if THIS phone is exhausted (no cross-phone routing to prevent contamination)
+      if phone_exhausted?(campaign_id, phone_number_id) do
+        # Phone exhausted - mark as FAILED (NOT requeued)
+        # These failed messages can be retried via "Retry Failed" button after campaign completes
+        case Jason.decode(data) do
+          {:ok, payload} ->
+            contact_id = payload["contact_id"]
+            phone = payload["phone"]
+            MessageTracking.record_failed(
+              campaign_id,
+              contact_id,
+              phone,
+              "N/A",  # template_name
+              "PHONE_EXHAUSTED",
+              "Phone #{phone_number_id} has all templates exhausted",
+              phone_number_id
+            )
+          _ -> :ok
+        end
+        Message.failed(message, "Phone exhausted - all templates failed")
+      else
+        # Phone is active - process normally with THIS phone's templates only
+        case Jason.decode(data) do
+          {:ok, payload} ->
+            # Get healthy templates for THIS phone only
+            healthy_templates = get_healthy_templates(campaign_id, phone_number_id, template_ids)
+            
+            if Enum.empty?(healthy_templates) do
+              # All templates exhausted for this phone - mark phone as exhausted
+              require Logger
+              Logger.error("All templates exhausted for phone #{phone_number_id} in campaign #{campaign_id}")
+              mark_phone_exhausted(campaign_id, phone_number_id)
+              Message.failed(message, "All templates exhausted for this phone")
+            else
+              # Try sending with fallback logic (pass cache for fast lookups)
+              try_send_with_template_fallback(message, payload, phone_number_id, campaign_id, healthy_templates, 0, templates_cache)
             end
 
-          {:error, :all_phones_exhausted} ->
-            # All phones exhausted - pause and re-queue
-            Orchestrator.pause_campaign(campaign_id)
-            requeue_message(campaign_id, phone_number_id, data)
-            message
+          {:error, _reason} ->
+            Message.failed(message, "Invalid JSON payload")
         end
-      catch
-        :all_templates_exhausted ->
-          # Campaign paused due to template exhaustion - message was re-queued
-          message
       end
     end
   end
 
-  # Check if phone is exhausted, return valid phone or error
-  defp get_valid_phone(campaign_id, current_phone_id) do
-    case Redix.command(:redix, ["SISMEMBER", "campaign:#{campaign_id}:exhausted_phones", current_phone_id]) do
-      {:ok, 0} ->
-        # Not exhausted, use current phone
-        {:ok, current_phone_id}
-      
-      {:ok, 1} ->
-        # Current phone is exhausted, try to find an alternative
-        find_alternative_phone(campaign_id)
-      
-      _ ->
-        # Redis error, assume current phone is ok
-        {:ok, current_phone_id}
+  # Simple check if THIS phone is exhausted (no fallback to other phones)
+  defp phone_exhausted?(campaign_id, phone_number_id) do
+    case Redix.command(:redix, ["SISMEMBER", "campaign:#{campaign_id}:exhausted_phones", phone_number_id]) do
+      {:ok, 1} -> true
+      _ -> false
     end
   end
 
-  defp find_alternative_phone(campaign_id) do
-    # Get campaign to find all phone_ids
-    campaign = TitanFlow.Campaigns.get_campaign!(campaign_id)
-    phone_ids = campaign.phone_ids || []
-    
-    # Get phones that are linked (have phone_number_id)
-    phones = Enum.map(phone_ids, fn id ->
-      TitanFlow.WhatsApp.get_phone_number!(id)
-    end)
-    phone_number_ids = Enum.map(phones, & &1.phone_number_id)
-    
-    # Get exhausted phones
-    {:ok, exhausted} = Redix.command(:redix, ["SMEMBERS", "campaign:#{campaign_id}:exhausted_phones"])
-    exhausted = exhausted || []
-    
-    # Find first non-exhausted phone
-    valid_phones = Enum.filter(phone_number_ids, fn pid -> pid not in exhausted end)
-    
-    case valid_phones do
-      [first | _] -> {:ok, first}
-      [] -> {:error, :all_phones_exhausted}
-    end
-  end
 
   # Load templates into memory cache at startup (eliminates DB queries during campaign)
   # This is CRITICAL for DB performance - must succeed to avoid 100s of queries/sec
@@ -324,8 +288,6 @@ defmodule TitanFlow.Campaigns.Pipeline do
   end
   
   defp try_send_with_template_fallback(message, payload, phone_number_id, campaign_id, [template_id | remaining_templates], attempt, templates_cache) do
-    require Logger
-    Logger.info("Pipeline: Trying template #{template_id}, attempt #{attempt}, remaining: #{length(remaining_templates)}")
     
     # Get template from cache (0ms lookup vs ~5-10ms DB query)
     {template_name, language} = case Map.get(templates_cache, template_id) do
@@ -340,21 +302,14 @@ defmodule TitanFlow.Campaigns.Pipeline do
         {cached_template.name, cached_template.language}
     end
     
-    Logger.debug("Pipeline: Using template: #{template_name}, language: #{language}")
-    
     # Try sending with this template
-    Logger.info("Pipeline: Calling dispatch_with_retry for template #{template_name}")
     result = dispatch_with_retry(message, payload, phone_number_id, campaign_id, template_name, language, 0)
-    Logger.info("Pipeline: dispatch_with_retry returned: #{inspect(result)}")
     
     # Check if we should try the next template
     case result do
       %Broadway.Message{status: {:failed, reason}} ->
         # Check if this was a template-specific error that warrants fallback
         if should_try_next_template?(reason, template_id, campaign_id, phone_number_id) do
-          require Logger
-          Logger.info("Template #{template_id} failed with retriable error, trying next template (#{length(remaining_templates)} remaining)")
-          
           # Try next template (pass cache through)
           try_send_with_template_fallback(message, payload, phone_number_id, campaign_id, remaining_templates, attempt + 1, templates_cache)
         else
@@ -404,19 +359,13 @@ defmodule TitanFlow.Campaigns.Pipeline do
     alias TitanFlow.Campaigns.MessageTracking
     alias TitanFlow.WhatsApp.Client
     
-    require Logger
-    Logger.debug("Pipeline: dispatch_with_retry called - template: #{template_name}, retry: #{retry_count}")
-    
     # Step 1: Check rate limit (fast, non-blocking)
-    Logger.debug("Pipeline: Checking rate limit for phone #{phone_number_id}")
     case RateLimiter.dispatch(phone_number_id, nil) do
       {:ok, :allowed, access_token} ->
-        Logger.info("Pipeline: Rate limit OK, sending to WhatsApp API")
-        # Step 2: Make HTTP call directly (parallel with 50 processors)
+        # Step 2: Make HTTP call directly (parallel with processors)
         components = build_components(payload)
         credentials = %{access_token: access_token, phone_number_id: phone_number_id}
         
-        Logger.debug("Pipeline: Calling Client.send_template for #{payload["phone"]}")
         result = Client.send_template(
           payload["phone"],
           template_name,
@@ -424,7 +373,6 @@ defmodule TitanFlow.Campaigns.Pipeline do
           components,
           credentials
         )
-        Logger.info("Pipeline: Client.send_template returned: #{inspect(elem(result, 0))}")
         
         case result do
           {:ok, body, headers} ->

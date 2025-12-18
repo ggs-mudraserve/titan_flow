@@ -48,7 +48,7 @@ config :titan_flow, TitanFlow.Repo,
   database: System.get_env("DATABASE_NAME") || "titan_flow",  # Your actual database name
   # Supavisor Transaction Mode settings (critical for connection pooler)
   prepare: :unnamed,  # Required for Supavisor transaction mode - don't use named prepared statements
-  pool_size: String.to_integer(System.get_env("POOL_SIZE") || "18"),  # Supavisor limit ~20, reserve 2 for admin
+  pool_size: String.to_integer(System.get_env("POOL_SIZE") || "30"),  # Increased to 30 to support 20 workers + Web
   queue_target: 5000,  # Allow requests to queue for up to 5 seconds
   queue_interval: 1000,  # Check queue every second
   timeout: 15000,  # Query timeout: 15 seconds (default is 15000)

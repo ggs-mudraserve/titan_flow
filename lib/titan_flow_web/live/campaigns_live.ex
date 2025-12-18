@@ -84,7 +84,7 @@ defmodule TitanFlowWeb.CampaignsLive do
                   <span class="text-blue-400 font-mono font-medium"><%= campaign.sent_count || 0 %></span>
                 </td>
                 <td class="px-4 py-2 whitespace-nowrap text-sm">
-                  <span class="text-emerald-400 font-mono font-medium"><%= campaign.delivered_count || 0 %></span>
+                  <span class="text-emerald-400 font-mono font-medium"><%= (campaign.delivered_count || 0) + (campaign.read_count || 0) %></span>
                 </td>
                 <td class="px-4 py-2 whitespace-nowrap text-sm">
                   <span class="text-violet-400 font-mono font-medium"><%= campaign.read_count || 0 %></span>
@@ -231,6 +231,24 @@ defmodule TitanFlowWeb.CampaignsLive do
   end
 
   @impl true
+  def handle_event("retry_failed", %{"id" => id}, socket) do
+    alias TitanFlow.Campaigns.Orchestrator
+    campaign_id = String.to_integer(id)
+    
+    # Start retry in background task to not block UI
+    Task.start(fn ->
+      Orchestrator.retry_failed_contacts(campaign_id)
+    end)
+    
+    page_data = Campaigns.list_campaigns(socket.assigns.page, @per_page)
+    campaign = Campaigns.get_campaign!(id)
+    
+    {:noreply, socket
+      |> assign(campaigns: page_data.entries, selected_campaign: campaign)
+      |> put_flash(:info, "Retrying failed contacts... Templates synced and campaign restarted.")}
+  end
+
+  @impl true
   def handle_event("delete_draft", %{"id" => id}, socket) do
     id = String.to_integer(id)
     campaign = Campaigns.get_campaign!(id)
@@ -351,11 +369,11 @@ defmodule TitanFlowWeb.CampaignsLive do
     # Smart Stats Logic
     raw = assigns.stats
     
-    # Effective Delivered = max(delivered, read, replied)
-    effective_delivered = Enum.max([raw.delivered_count, raw.read_count, raw.replied_count])
+    # Effective Delivered = delivered + read (read implies delivered)
+    effective_delivered = raw.delivered_count + raw.read_count
     
-    # Effective Read = max(read, replied)
-    effective_read = Enum.max([raw.read_count, raw.replied_count])
+    # Effective Read = read + replied (replied implies read)
+    effective_read = raw.read_count + raw.replied_count
     
     replied = raw.replied_count
     sent = raw.sent_count
@@ -560,6 +578,19 @@ defmodule TitanFlowWeb.CampaignsLive do
                   ▶ Resume Campaign
                 </button>
               <% end %>
+            </div>
+          <% end %>
+          
+          <!-- Retry Failed Button (for completed campaigns with failures) -->
+          <%= if @campaign.status == "completed" && @stats.failed_count > 0 do %>
+            <div class="flex gap-3">
+              <button 
+                phx-click="retry_failed" 
+                phx-value-id={@campaign.id}
+                class="flex-1 h-9 px-4 bg-orange-600 hover:bg-orange-500 text-white rounded-md font-medium text-sm transition-colors"
+              >
+                🔄 Retry Failed (<%= @stats.failed_count %>)
+              </button>
             </div>
           <% end %>
 

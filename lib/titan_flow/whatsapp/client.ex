@@ -52,6 +52,7 @@ defmodule TitanFlow.WhatsApp.Client do
     }
 
     case Req.post(url,
+           finch: TitanFlow.Finch,
            json: payload,
            headers: [
              {"Authorization", "Bearer #{access_token}"},
@@ -135,6 +136,7 @@ defmodule TitanFlow.WhatsApp.Client do
     }
 
     case Req.post(url,
+           finch: TitanFlow.Finch,
            json: payload,
            headers: [
              {"Authorization", "Bearer #{access_token}"},

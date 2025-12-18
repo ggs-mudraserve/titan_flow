@@ -41,7 +41,7 @@ defmodule TitanFlowWeb.CoreComponents do
 
   def flash_group(assigns) do
     ~H"""
-    <div class="fixed top-4 right-4 z-50 space-y-2">
+    <div class="fixed bottom-4 right-4 z-50 space-y-2">
       <.flash :if={@flash["info"]} kind={:info} message={@flash["info"]} />
       <.flash :if={@flash["error"]} kind={:error} message={@flash["error"]} />
     </div>

@@ -177,7 +177,8 @@ defmodule TitanFlow.Campaigns.BufferManager do
 
   defp fetch_unsent_contacts(campaign_id, after_id, limit, phone_index, total_phones) do
     # Efficient cursor-based pagination
-    # All BufferManagers fetch from same pool - cursor ensures no overlaps
+    # Only fetches contacts that have NEVER been sent (no message_log entry at all)
+    # Failed contacts are NOT retried here - use "Retry Failed" button after campaign completes
     # Duplicate protection via unique meta_message_id constraint prevents double-sends
     query = from c in "contacts",
       left_join: m in "message_logs", 
@@ -185,6 +186,7 @@ defmodule TitanFlow.Campaigns.BufferManager do
       where: c.campaign_id == ^campaign_id,
       where: c.id > ^after_id,
       where: c.is_blacklisted == false,
+      # Only truly unsent contacts (no message_log entry)
       where: is_nil(m.id),
       order_by: [asc: c.id],
       limit: ^limit,

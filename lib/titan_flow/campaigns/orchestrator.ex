@@ -339,6 +339,127 @@ defmodule TitanFlow.Campaigns.Orchestrator do
     end
   end
   
+  @doc """
+  Retry all failed contacts for a completed campaign.
+  
+  1. Syncs templates from Meta (get fresh status)
+  2. Clears all Redis exhausted/failed state
+  3. Identifies phones with APPROVED templates
+  4. Restarts campaign with only those phones
+  5. BufferManager will fetch failed contacts from DB
+  """
+  def retry_failed_contacts(campaign_id) do
+    campaign = Campaigns.get_campaign!(campaign_id)
+    
+    Logger.info("Retrying failed contacts for campaign #{campaign_id}")
+    
+    # Step 1: Sync templates from Meta for each phone
+    for config <- campaign.senders_config || [] do
+      phone_id = config["phone_id"]
+      try do
+        TitanFlow.WhatsApp.sync_templates(phone_id)
+        Logger.info("Synced templates for phone #{phone_id}")
+      rescue
+        e -> Logger.warning("Failed to sync templates for phone #{phone_id}: #{inspect(e)}")
+      end
+    end
+    
+    # Step 2: Clear ALL campaign Redis state (exhausted phones, failed templates)
+    {:ok, keys} = Redix.command(:redix, ["KEYS", "campaign:#{campaign_id}:*"])
+    for key <- keys || [] do
+      Redix.command(:redix, ["DEL", key])
+    end
+    Logger.info("Cleared #{length(keys || [])} Redis keys for campaign #{campaign_id}")
+    
+    # Step 3: Get phones with APPROVED templates only
+    valid_phone_ids = for config <- campaign.senders_config || [], reduce: [] do
+      acc ->
+        phone_id = config["phone_id"]
+        template_ids = config["template_ids"] || []
+        
+        # Check which templates are APPROVED
+        approved_templates = Enum.filter(template_ids, fn tid ->
+          try do
+            template = TitanFlow.Templates.get_template!(tid)
+            template.status == "APPROVED"
+          rescue
+            _ -> false
+          end
+        end)
+        
+        if length(approved_templates) > 0 do
+          [phone_id | acc]
+        else
+          Logger.warning("Phone #{phone_id} has no APPROVED templates, skipping")
+          acc
+        end
+    end
+    
+    if length(valid_phone_ids) == 0 do
+      Logger.error("No phones have APPROVED templates for campaign #{campaign_id}")
+      Campaigns.update_campaign(campaign, %{
+        status: "paused",
+        error_message: "No phones have APPROVED templates. Please sync templates first."
+      })
+      {:error, :no_valid_phones}
+    else
+      # Step 4: Update campaign status to running
+      Campaigns.update_campaign(campaign, %{
+        status: "running",
+        error_message: nil,
+        completed_at: nil
+      })
+      
+      # Step 5: Start pipelines for valid phones only
+      # Use existing restart_pipelines logic but filter to valid phones
+      phones = Enum.map(valid_phone_ids, &WhatsApp.get_phone_number!/1)
+      phone_template_map = build_phone_template_map(campaign, valid_phone_ids, campaign.template_ids || [])
+      
+      total_phones = length(phones)
+      phones
+      |> Enum.with_index()
+      |> Enum.each(fn {phone, phone_index} ->
+        phone_template_ids = Map.get(phone_template_map, phone.id, [])
+        
+        # Start RateLimiter
+        start_rate_limiter(phone)
+        
+        # Start BufferManager (will fetch failed/unsent contacts)
+        buffer_name = {:via, Registry, {TitanFlow.BufferRegistry, {campaign.id, phone.phone_number_id}}}
+        case GenServer.whereis(buffer_name) do
+          nil ->
+            DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
+              TitanFlow.Campaigns.BufferManager,
+              campaign_id: campaign.id,
+              phone_number_id: phone.phone_number_id,
+              phone_index: phone_index,
+              total_phones: total_phones
+            })
+          _ -> :ok
+        end
+        
+        # Start Pipeline
+        case Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone.phone_number_id) do
+          [] ->
+            pipeline_spec = %{
+              id: {:pipeline, phone.phone_number_id},
+              start: {Pipeline, :start_link, [[
+                phone_number_id: phone.phone_number_id,
+                campaign_id: campaign.id,
+                template_ids: phone_template_ids
+              ]]},
+              restart: :permanent
+            }
+            DynamicSupervisor.start_child(TitanFlow.Campaigns.PipelineSupervisor, pipeline_spec)
+          _ -> :ok
+        end
+      end)
+      
+      Logger.info("Campaign #{campaign_id} retry started with #{length(valid_phone_ids)} phones")
+      {:ok, :retry_started}
+    end
+  end
+  
   defp build_phone_template_map(campaign, phone_ids, template_ids) do
     # Try to use senders_config (new format)
     if campaign.senders_config && length(campaign.senders_config) > 0 do

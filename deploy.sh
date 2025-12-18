@@ -28,9 +28,11 @@ build() {
         export $(cat .env.production | grep -v '^#' | xargs)
     fi
     
-    # Clean previous build
-    log_info "Cleaning previous build..."
-    rm -rf _build/prod
+    # Clean previous build (carefully)
+    log_info "Cleaning application artifacts but preserving release binaries..."
+    # We remove only the compiled beams to ensure a fresh app build, 
+    # but keep the 'rel' directory so the service can still be stopped/managed.
+    find _build/prod -maxdepth 1 -not -name 'rel' -not -name 'prod' -exec rm -rf {} + 2>/dev/null || true
     
     # Get dependencies
     log_info "Getting dependencies..."
@@ -133,6 +135,9 @@ case "$1" in
         install_service
         ;;
     full)
+        log_info "Starting full maintenance deployment..."
+        # Stop service first to avoid port conflicts during migration/build
+        sudo systemctl stop $SERVICE_NAME || true
         build
         deploy
         ;;

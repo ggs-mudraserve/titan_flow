@@ -16,6 +16,10 @@ defmodule TitanFlow.Application do
       {DNSCluster, query: Application.get_env(:titan_flow, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: TitanFlow.PubSub},
 
+      # HTTP Client Connection Pool
+      # Supports 500 concurrent connections to Meta API
+      {Finch, name: TitanFlow.Finch, pools: %{default: [size: 500, count: 1]}},
+
       # Redis connection pool
       {Redix,
        host: redix_config[:host],
