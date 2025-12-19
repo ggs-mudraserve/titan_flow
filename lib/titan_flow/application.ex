@@ -55,6 +55,10 @@ defmodule TitanFlow.Application do
       # DynamicSupervisor for Phone Number Rate Limiters
       {DynamicSupervisor, strategy: :one_for_one, name: TitanFlow.PhoneSupervisor},
 
+      # Task.Supervisor for bounded async operations (Phase 4: 5B)
+      # Use: Task.Supervisor.start_child(TitanFlow.TaskSupervisor, fn -> ... end)
+      {Task.Supervisor, name: TitanFlow.TaskSupervisor},
+
       # Draft campaign cleanup (deletes orphan drafts after 1 hour) -- REMOVED
       # TitanFlow.Campaigns.DraftCleanup,
 

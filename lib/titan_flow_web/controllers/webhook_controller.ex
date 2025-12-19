@@ -34,8 +34,8 @@ defmodule TitanFlowWeb.WebhookController do
   """
   def handle(conn, params) do
     # Always return 200 OK immediately to keep Meta happy
-    # Process in background
-    Task.start(fn -> process_webhook(params) end)
+    # Process in background using supervised task (Phase 4: 5B)
+    Task.Supervisor.start_child(TitanFlow.TaskSupervisor, fn -> process_webhook(params) end)
 
     conn
     |> put_status(200)
@@ -114,10 +114,13 @@ defmodule TitanFlowWeb.WebhookController do
             category: new_category || db_template.category
           })
           
+          # Invalidate ETS cache so Pipeline picks up the change (Phase 4: 4C)
+          TitanFlow.Templates.TemplateCache.invalidate(db_template.id)
+          
           # Cache the paused status in Redis for fast Pipeline pre-flight check
           alias TitanFlow.Campaigns.Cache
           Cache.mark_template_paused(template_name)
-          Logger.warning("Template #{template_name} marked as PAUSED in Redis cache")
+          Logger.warning("Template #{template_name} marked as PAUSED in Redis cache and ETS invalidated")
           
           # Trigger switch for all affected campaigns
           QualityMonitor.switch_template(db_template.id)
