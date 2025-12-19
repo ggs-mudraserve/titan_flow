@@ -173,11 +173,11 @@ defmodule TitanFlow.Campaigns.MessageTracking do
     end
   end
 
-  defp find_log_with_retry(meta_message_id, retries \\ 3) do
+  defp find_log_with_retry(meta_message_id, retries \\ 2) do
     case Repo.get_by(MessageLog, meta_message_id: meta_message_id) do
       nil when retries > 0 ->
-        # Sleep 500ms and retry to allow LogBatcher to catch up
-        Process.sleep(500)
+        # Sleep 1000ms and retry to allow LogBatcher to catch up (flushes every 2s)
+        Process.sleep(1000)
         find_log_with_retry(meta_message_id, retries - 1)
       
       result -> result
