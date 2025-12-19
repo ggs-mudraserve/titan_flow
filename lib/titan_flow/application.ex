@@ -73,6 +73,9 @@ defmodule TitanFlow.Application do
       # Metrics Reporter for periodic system health monitoring (Phase 1: 5A + 6A)
       TitanFlow.Campaigns.MetricsReporter,
 
+      # AutoScaler for dynamic MPS adjustment based on queue depth and DB load (Phase 3: 7B + 7C)
+      TitanFlow.Campaigns.AutoScaler,
+
       # Campaign pipelines are started dynamically when a campaign begins:
       # TitanFlow.Campaigns.Pipeline.start_link(phone_number_id: "...", template_name: "...", ...)
 
