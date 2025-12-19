@@ -289,16 +289,25 @@ defmodule TitanFlow.Campaigns.Pipeline do
   
   defp try_send_with_template_fallback(message, payload, phone_number_id, campaign_id, [template_id | remaining_templates], attempt, templates_cache) do
     
-    # Get template from cache (0ms lookup vs ~5-10ms DB query)
+    # Get template from local cache (0ms lookup vs ~5-10ms DB query)
     {template_name, language} = case Map.get(templates_cache, template_id) do
       nil ->
-        # Template not in cache (shouldn't happen) - fall back to DB for safety
-        Logger.warning("Template #{template_id} not in cache, fetching from DB (fallback)")
-        template = TitanFlow.Templates.get_template!(template_id)
-        {template.name, template.language || "en"}
+        # Local cache miss - try global ETS cache first (Phase 2: 4A)
+        require Logger
+        case TitanFlow.Templates.TemplateCache.get(template_id) do
+          {:ok, template} ->
+            Logger.debug("Template #{template_id} found in ETS cache")
+            {template.name, template.language || "en"}
+          
+          _ ->
+            # ETS cache miss too - fall back to DB (last resort)
+            Logger.warning("Template #{template_id} not in any cache, fetching from DB")
+            template = TitanFlow.Templates.get_template!(template_id)
+            {template.name, template.language || "en"}
+        end
         
       cached_template ->
-        # Use cached template data (fast!)
+        # Use local cached template data (fastest!)
         {cached_template.name, cached_template.language}
     end
     
