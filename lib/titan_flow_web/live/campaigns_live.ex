@@ -84,7 +84,7 @@ defmodule TitanFlowWeb.CampaignsLive do
                   <span class="text-blue-400 font-mono font-medium"><%= campaign.sent_count || 0 %></span>
                 </td>
                 <td class="px-4 py-2 whitespace-nowrap text-sm">
-                  <span class="text-emerald-400 font-mono font-medium"><%= (campaign.delivered_count || 0) + (campaign.read_count || 0) %></span>
+                  <span class="text-emerald-400 font-mono font-medium"><%= campaign.delivered_count || 0 %></span>
                 </td>
                 <td class="px-4 py-2 whitespace-nowrap text-sm">
                   <span class="text-violet-400 font-mono font-medium"><%= campaign.read_count || 0 %></span>
@@ -369,11 +369,12 @@ defmodule TitanFlowWeb.CampaignsLive do
     # Smart Stats Logic
     raw = assigns.stats
     
-    # Effective Delivered = delivered + read (read implies delivered)
-    effective_delivered = raw.delivered_count + raw.read_count
+    # NOTE: delivered_count from get_realtime_stats ALREADY includes read 
+    # (it's calculated as delivered + read statuses), so don't add again!
+    effective_delivered = raw.delivered_count
     
-    # Effective Read = read + replied (replied implies read)
-    effective_read = raw.read_count + raw.replied_count
+    # Read count is already accurate from get_realtime_stats
+    effective_read = raw.read_count
     
     replied = raw.replied_count
     sent = raw.sent_count

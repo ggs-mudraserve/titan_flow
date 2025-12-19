@@ -64,6 +64,9 @@ defmodule TitanFlow.Application do
       # ETS cache for phone_number_id -> db_id lookups (webhook optimization)
       TitanFlow.WhatsApp.PhoneCache,
 
+      # Log Batcher for async message_logs and contact_history batch inserts (Formula 1 v2)
+      TitanFlow.Campaigns.LogBatcher,
+
       # Campaign pipelines are started dynamically when a campaign begins:
       # TitanFlow.Campaigns.Pipeline.start_link(phone_number_id: "...", template_name: "...", ...)
 

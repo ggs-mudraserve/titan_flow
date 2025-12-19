@@ -12,8 +12,88 @@ defmodule TitanFlow.Templates do
 
   # Template CRUD
 
-  def list_templates do
-    Repo.all(from t in Template, order_by: [desc: t.inserted_at])
+  @doc """
+  List templates with optional pagination and filters.
+  
+  ## Options
+  - `page` - Page number (default: 1)
+  - `per_page` - Items per page (default: :all for backward compatibility)
+  - `filters` - Map with optional keys: :category, :status, :search, :phone
+  
+  ## Returns
+  When paginated: %{entries: [...], page: int, total_pages: int, total: int}
+  When not paginated (per_page: :all): list of templates
+  """
+  def list_templates(page \\ 1, per_page \\ :all, filters \\ %{})
+
+  # Backward compatible: no pagination
+  def list_templates(_page, :all, filters) do
+    base_query()
+    |> apply_filters(filters)
+    |> order_by(desc: :inserted_at)
+    |> Repo.all()
+  end
+
+  # Paginated version
+  def list_templates(page, per_page, filters) when is_integer(per_page) do
+    query = base_query()
+      |> apply_filters(filters)
+      |> order_by(desc: :inserted_at)
+    
+    total = Repo.aggregate(query, :count)
+    total_pages = max(1, ceil(total / per_page))
+    offset = (page - 1) * per_page
+    
+    entries = query
+      |> limit(^per_page)
+      |> offset(^offset)
+      |> Repo.all()
+    
+    %{
+      entries: entries,
+      page: page,
+      total_pages: total_pages,
+      total: total
+    }
+  end
+
+  defp base_query do
+    from(t in Template)
+  end
+
+  defp apply_filters(query, filters) when is_map(filters) do
+    query
+    |> filter_by_category(filters[:category])
+    |> filter_by_status(filters[:status])
+    |> filter_by_search(filters[:search])
+    |> filter_by_phone(filters[:phone])
+  end
+
+  defp filter_by_category(query, nil), do: query
+  defp filter_by_category(query, "all"), do: query
+  defp filter_by_category(query, category) do
+    cat_upper = String.upcase(category)
+    where(query, [t], fragment("UPPER(?)", t.category) == ^cat_upper)
+  end
+
+  defp filter_by_status(query, nil), do: query
+  defp filter_by_status(query, "all"), do: query
+  defp filter_by_status(query, status) do
+    status_upper = String.upcase(status)
+    where(query, [t], fragment("UPPER(?)", t.status) == ^status_upper)
+  end
+
+  defp filter_by_search(query, nil), do: query
+  defp filter_by_search(query, ""), do: query
+  defp filter_by_search(query, search) do
+    pattern = "%#{String.downcase(search)}%"
+    where(query, [t], ilike(t.name, ^pattern))
+  end
+
+  defp filter_by_phone(query, nil), do: query
+  defp filter_by_phone(query, "all"), do: query
+  defp filter_by_phone(query, phone_name) do
+    where(query, [t], t.phone_display_name == ^phone_name)
   end
 
   @doc """
@@ -104,30 +184,53 @@ defmodule TitanFlow.Templates do
   end
 
   defp upsert_template(meta_template, phone_number) do
-    attrs = %{
-      meta_template_id: meta_template["id"],
-      name: meta_template["name"],
-      status: meta_template["status"],
-      language: meta_template["language"],
-      category: meta_template["category"],
-      components: meta_template["components"],
-      phone_number_id: phone_number.id,
-      phone_display_name: phone_number.display_name || phone_number.mobile_number || "Unknown"
-    }
+    status = meta_template["status"]
+    
+    # Auto-delete DISABLED templates (if not referenced by campaigns)
+    if status == "DISABLED" do
+      case get_by_meta_id(meta_template["id"]) do
+        nil -> :ok  # Not in DB, nothing to delete
+        existing -> 
+          try do
+            case Repo.delete(existing) do
+              {:ok, _} -> 
+                Logger.info("Auto-deleted DISABLED template: #{meta_template["name"]}")
+              {:error, changeset} -> 
+                Logger.warning("Could not delete DISABLED template #{meta_template["name"]}: #{inspect(changeset.errors)}")
+            end
+          rescue
+            Ecto.ConstraintError ->
+              # Template is still referenced by a campaign, just update status instead
+              Logger.warning("Template #{meta_template["name"]} is referenced by campaigns, updating status only")
+              update_template(existing, %{status: "DISABLED"})
+          end
+      end
+    else
+      attrs = %{
+        meta_template_id: meta_template["id"],
+        name: meta_template["name"],
+        status: status,
+        language: meta_template["language"],
+        category: meta_template["category"],
+        components: meta_template["components"],
+        phone_number_id: phone_number.id,
+        phone_display_name: phone_number.display_name || phone_number.mobile_number || "Unknown"
+      }
 
-    case get_by_meta_id(meta_template["id"]) do
-      nil -> 
-        case create_template(attrs) do
-          {:ok, _} -> :ok
-          {:error, changeset} -> 
-            Logger.error("Failed to create template #{meta_template["name"]}: #{inspect(changeset.errors)}")
-        end
-      existing -> 
-        case update_template(existing, attrs) do
-          {:ok, _} -> :ok
-          {:error, changeset} ->
-            Logger.error("Failed to update template #{meta_template["name"]}: #{inspect(changeset.errors)}")
-        end
+      case get_by_meta_id(meta_template["id"]) do
+        nil -> 
+          case create_template(attrs) do
+            {:ok, _} -> :ok
+            {:error, changeset} -> 
+              Logger.error("Failed to create template #{meta_template["name"]}: #{inspect(changeset.errors)}")
+          end
+        existing -> 
+          case update_template(existing, attrs) do
+            {:ok, _} -> :ok
+            {:error, changeset} ->
+              Logger.error("Failed to update template #{meta_template["name"]}: #{inspect(changeset.errors)}")
+          end
+      end
     end
   end
 

@@ -17,6 +17,8 @@ defmodule TitanFlowWeb.TemplateLive.Index do
       |> assign(cloning_template: nil)
       |> assign(show_preview_modal: false)
       |> assign(preview_template: nil)
+      |> assign(show_delete_modal: false)
+      |> assign(deleting_template: nil)
       |> assign(clone_name: "")
       |> assign(clone_body_text: "")
       |> assign(clone_language: "en_US")
@@ -31,6 +33,12 @@ defmodule TitanFlowWeb.TemplateLive.Index do
       |> assign(filter_status: "all")
       |> assign(filter_search: "")
       |> assign(filter_phone: "all")
+      # Pagination
+      |> assign(page: 1)
+      |> assign(total_pages: 1)
+      |> assign(total: 0)
+      |> assign(target_phone_id: nil)
+      |> assign(phone_numbers: WhatsApp.list_phone_numbers())
       |> allow_upload(:header_media, 
            accept: ~w(.jpg .jpeg .png .mp4 .3gp .pdf), 
            max_entries: 1, 
@@ -44,12 +52,22 @@ defmodule TitanFlowWeb.TemplateLive.Index do
 
   @impl true
   def handle_event("sync", _params, socket) do
+    require Logger
+    Logger.info("Template sync started")
     socket = assign(socket, syncing: true)
     parent = self()
     
     Task.start(fn ->
-      result = Templates.sync_from_meta()
-      send(parent, {:sync_complete, result})
+      try do
+        Logger.info("Template sync Task running...")
+        result = Templates.sync_from_meta()
+        Logger.info("Template sync completed: #{inspect(result)}")
+        send(parent, {:sync_complete, result})
+      rescue
+        e ->
+          Logger.error("Template sync crashed: #{inspect(e)}")
+          send(parent, {:sync_complete, {:error, e}})
+      end
     end)
     
     {:noreply, socket}
@@ -108,6 +126,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
       |> assign(clone_buttons: extract_buttons(template.components))
       |> assign(clone_variables: extract_variables(body_text))
       |> assign(variable_values: %{})
+      |> assign(target_phone_id: template.phone_number_id)
       |> assign(media_handle: nil)
       |> assign(uploaded_file: nil)
       |> assign(media_type: nil)
@@ -134,9 +153,54 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   end
 
   @impl true
-  def handle_event("update_clone_name", %{"value" => name}, socket) do
+  def handle_event("open_delete_modal", %{"id" => id}, socket) do
+    template = Templates.get_template!(id)
+    {:noreply, socket
+      |> assign(show_delete_modal: true)
+      |> assign(deleting_template: template)}
+  end
+
+  @impl true
+  def handle_event("close_delete_modal", _params, socket) do
+    {:noreply, assign(socket, show_delete_modal: false, deleting_template: nil)}
+  end
+
+  @impl true
+  def handle_event("confirm_delete", _params, socket) do
+    template = socket.assigns.deleting_template
+    
+    case Templates.delete_template(template) do
+      {:ok, _} ->
+        {:noreply, socket
+          |> put_flash(:info, "Template '#{template.name}' deleted successfully.")
+          |> assign(show_delete_modal: false, deleting_template: nil)
+          |> load_templates()}
+      {:error, _} ->
+        {:noreply, socket
+          |> put_flash(:error, "Failed to delete template.")
+          |> assign(show_delete_modal: false, deleting_template: nil)}
+    end
+  end
+
+  @impl true
+  def handle_event("update_clone_form", params, socket) do
+    require Logger
+    Logger.debug("update_clone_form params: #{inspect(params)}")
+    
+    socket = socket
+      |> assign(clone_name: params["clone_name"] || socket.assigns.clone_name)
+      |> assign(clone_language: params["clone_language"] || socket.assigns.clone_language)
+    
+    {:noreply, socket}
+  end
+
+  # Keep old handler for backward compatibility
+  @impl true
+  def handle_event("update_clone_name", params, socket) do
+    name = params["clone_name"] || params["value"] || socket.assigns.clone_name
     {:noreply, assign(socket, clone_name: name)}
   end
+
 
 
   @impl true
@@ -221,18 +285,37 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   # Unified filter handler for the filter form
   @impl true
   def handle_event("filter", params, socket) do
-    IO.inspect(params, label: "FILTER PARAMS")
     socket = socket
       |> assign(filter_search: params["search"] || socket.assigns.filter_search)
       |> assign(filter_phone: params["phone"] || socket.assigns.filter_phone)
       |> assign(filter_category: params["category"] || socket.assigns.filter_category)
       |> assign(filter_status: params["status"] || socket.assigns.filter_status)
+      |> assign(page: 1)  # Reset to page 1 on filter change
+      |> load_templates()
     {:noreply, socket}
   end
 
   @impl true
-  def handle_event("update_clone_language", %{"language" => language}, socket) do
+  def handle_event("change_page", %{"page" => page_str}, socket) do
+    page = String.to_integer(page_str)
+    socket = socket
+      |> assign(page: page)
+      |> load_templates()
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_event("update_clone_language", params, socket) do
+    require Logger
+    Logger.debug("update_clone_language params: #{inspect(params)}")
+    # Handle the select change which sends {"language" => code}
+    language = params["language"] || socket.assigns.clone_language
     {:noreply, assign(socket, clone_language: language)}
+  end
+
+  @impl true
+  def handle_event("update_target_phone", %{"target_phone" => phone_id}, socket) do
+    {:noreply, assign(socket, target_phone_id: String.to_integer(phone_id))}
   end
 
   # Handle upload progress - auto-upload to Meta when file upload completes
@@ -334,13 +417,15 @@ defmodule TitanFlowWeb.TemplateLive.Index do
     end
   end
 
-  @impl true
   def handle_event("create_clone", _params, socket) do
     template = socket.assigns.cloning_template
-    phone_numbers = WhatsApp.list_phone_numbers()
+    target_phone_id = socket.assigns.target_phone_id
     
-    case phone_numbers do
-      [phone | _] ->
+    # Find the selected phone number
+    target_phone = Enum.find(socket.assigns.phone_numbers, fn p -> p.id == target_phone_id end)
+    
+    case target_phone do
+      %{} = phone ->
         # Build components with updated body text and optional header
         components = build_clone_components(
           template.components,
@@ -350,6 +435,9 @@ defmodule TitanFlowWeb.TemplateLive.Index do
           socket.assigns.clone_buttons,
           socket.assigns.variable_values
         )
+        
+        # Determine category - default to MARKETING if nil
+        category = template.category || "MARKETING"
         
         case Templates.create_clone(
           template,
@@ -370,13 +458,27 @@ defmodule TitanFlowWeb.TemplateLive.Index do
           {:error, reason} ->
             {:noreply, put_flash(socket, :error, "Clone failed: #{inspect(reason)}")}
         end
-      [] ->
-        {:noreply, put_flash(socket, :error, "No phone numbers configured")}
+      nil ->
+        {:noreply, put_flash(socket, :error, "Please select a phone number")}
     end
   end
 
   defp load_templates(socket) do
-    assign(socket, templates: Templates.list_templates())
+    filters = %{
+      category: Map.get(socket.assigns, :filter_category, "all"),
+      status: Map.get(socket.assigns, :filter_status, "all"),
+      search: Map.get(socket.assigns, :filter_search, ""),
+      phone: Map.get(socket.assigns, :filter_phone, "all")
+    }
+    
+    page = Map.get(socket.assigns, :page, 1)
+    result = Templates.list_templates(page, 25, filters)
+    
+    socket
+    |> assign(templates: result.entries)
+    |> assign(page: result.page)
+    |> assign(total_pages: result.total_pages)
+    |> assign(total: result.total)
   end
 
   defp extract_body_text(nil), do: ""
@@ -518,24 +620,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   end
   defp preview_body_text(_, _), do: ""
 
-  defp filtered_templates(templates, category, status, search, phone) do
-    templates
-    |> Enum.filter(fn t ->
-      # Both sides uppercase for consistent comparison
-      template_category = String.upcase(t.category || "")
-      filter_category = String.upcase(category || "")
-      
-      template_status = String.upcase(t.status || "")
-      filter_status = String.upcase(status || "")
-      
-      category_match = filter_category == "ALL" or template_category == filter_category
-      status_match = filter_status == "ALL" or template_status == filter_status
-      search_match = search == "" or String.contains?(String.downcase(t.name || ""), String.downcase(search))
-      phone_match = phone == "all" or (t.phone_display_name || "") == phone
-      
-      category_match and status_match and search_match and phone_match
-    end)
-  end
+  # Client-side filtering removed - now handled server-side in Templates context
 
   defp language_options do
     [
@@ -573,7 +658,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
       <!-- Header -->
       <div class="flex items-center justify-between">
         <div>
-          <h1 class="text-2xl font-bold text-base-content">Templates <span class="ml-2 px-2.5 py-0.5 rounded-full bg-base-300 text-sm font-normal text-base-content/70"><%= length(@templates) %></span></h1>
+          <h1 class="text-2xl font-bold text-base-content">Templates <span class="ml-2 px-2.5 py-0.5 rounded-full bg-base-300 text-sm font-normal text-base-content/70"><%= @total %></span></h1>
           <p class="text-base-content/60 text-sm mt-1">Manage your WhatsApp message templates</p>
         </div>
         <button
@@ -651,13 +736,9 @@ defmodule TitanFlowWeb.TemplateLive.Index do
             </p>
           </div>
         <% else %>
-          <% filtered = filtered_templates(@templates, @filter_category, @filter_status, @filter_search, @filter_phone) %>
           <table class="w-full">
             <thead class="bg-primary/5 border-b border-base-200">
               <tr>
-                <th class="w-12 px-4 py-3">
-                  <input type="checkbox" class="checkbox checkbox-sm" />
-                </th>
                 <th class="text-left px-4 py-3 text-xs font-semibold text-base-content/70 uppercase tracking-wider">Template</th>
                 <th class="text-left px-4 py-3 text-xs font-semibold text-base-content/70 uppercase tracking-wider">Language</th>
                 <th class="text-left px-4 py-3 text-xs font-semibold text-base-content/70 uppercase tracking-wider">Category</th>
@@ -666,11 +747,8 @@ defmodule TitanFlowWeb.TemplateLive.Index do
               </tr>
             </thead>
             <tbody class="divide-y divide-base-200">
-              <%= for template <- filtered do %>
+              <%= for template <- @templates do %>
                 <tr class="hover:bg-base-50 transition-colors">
-                  <td class="px-4 py-4">
-                    <input type="checkbox" class="checkbox checkbox-sm" />
-                  </td>
                   <td class="px-4 py-4">
                     <div class="flex items-center gap-3">
                       <div>
@@ -707,9 +785,6 @@ defmodule TitanFlowWeb.TemplateLive.Index do
                       >
                         👁️ Preview
                       </button>
-                      <button class="p-2 rounded-lg text-base-content/50 hover:bg-base-200 hover:text-base-content transition-colors" title="Edit">
-                        ✏️
-                      </button>
                       <button
                         phx-click="open_clone_modal"
                         phx-value-id={template.id}
@@ -718,7 +793,12 @@ defmodule TitanFlowWeb.TemplateLive.Index do
                       >
                         📋
                       </button>
-                      <button class="p-2 rounded-lg text-error/50 hover:bg-error/10 hover:text-error transition-colors" title="Delete">
+                      <button
+                        phx-click="open_delete_modal"
+                        phx-value-id={template.id}
+                        class="p-2 rounded-lg text-error/50 hover:bg-error/10 hover:text-error transition-colors"
+                        title="Delete"
+                      >
                         🗑️
                       </button>
                     </div>
@@ -728,9 +808,40 @@ defmodule TitanFlowWeb.TemplateLive.Index do
             </tbody>
           </table>
           
-          <%= if Enum.empty?(filtered) do %>
-            <div class="p-8 text-center border-t border-base-200">
-              <p class="text-base-content/60">No templates match your filters.</p>
+          <!-- Pagination -->
+          <%= if @total_pages > 1 do %>
+            <div class="px-4 py-3 border-t border-base-200 flex items-center justify-between bg-base-100/50">
+              <p class="text-sm text-base-content/60">
+                Showing <%= (@page - 1) * 25 + 1 %> - <%= min(@page * 25, @total) %> of <%= @total %> templates
+              </p>
+              <div class="flex items-center gap-1">
+                <button
+                  phx-click="change_page"
+                  phx-value-page={max(1, @page - 1)}
+                  disabled={@page == 1}
+                  class="px-3 py-1.5 rounded-lg text-sm font-medium bg-base-200 text-base-content/70 hover:bg-base-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  ← Prev
+                </button>
+                <%= for p <- max(1, @page - 2)..min(@total_pages, @page + 2) do %>
+                  <button
+                    phx-click="change_page"
+                    phx-value-page={p}
+                    class={"px-3 py-1.5 rounded-lg text-sm font-medium transition-colors " <>
+                      if(p == @page, do: "bg-primary text-primary-content", else: "bg-base-200 text-base-content/70 hover:bg-base-300")}
+                  >
+                    <%= p %>
+                  </button>
+                <% end %>
+                <button
+                  phx-click="change_page"
+                  phx-value-page={min(@total_pages, @page + 1)}
+                  disabled={@page == @total_pages}
+                  class="px-3 py-1.5 rounded-lg text-sm font-medium bg-base-200 text-base-content/70 hover:bg-base-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Next →
+                </button>
+              </div>
             </div>
           <% end %>
         <% end %>
@@ -767,7 +878,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
               <div class="flex-1 p-6 space-y-6 border-r border-base-200 max-h-[70vh] overflow-y-auto">
                 
                 <!-- Basic Information Section -->
-                <div class="space-y-4">
+                <form phx-change="update_clone_form" phx-debounce="300" class="space-y-4">
                   <div class="flex items-center gap-2 text-sm font-medium text-base-content">
                     <span class="text-primary">📝</span> Basic Information
                   </div>
@@ -777,8 +888,8 @@ defmodule TitanFlowWeb.TemplateLive.Index do
                       <label class="block text-xs font-medium text-base-content/70 mb-1.5">📄 Template Name *</label>
                       <input
                         type="text"
+                        name="clone_name"
                         value={@clone_name}
-                        phx-blur="update_clone_name"
                         class="w-full bg-base-200 border border-transparent focus:border-primary rounded-lg px-3 py-2.5 text-base-content placeholder-base-content/40 focus:outline-none transition-colors text-sm"
                       />
                       <p class="mt-1 text-xs text-base-content/40">lowercase, numbers, _</p>
@@ -786,8 +897,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
                     <div>
                       <label class="block text-xs font-medium text-base-content/70 mb-1.5">🌐 Language</label>
                       <select
-                        phx-change="update_clone_language"
-                        name="language"
+                        name="clone_language"
                         class="w-full bg-base-200 border border-transparent focus:border-primary rounded-lg px-3 py-2.5 text-base-content text-sm focus:outline-none"
                       >
                         <%= for {label, code} <- language_options() do %>
@@ -795,6 +905,26 @@ defmodule TitanFlowWeb.TemplateLive.Index do
                         <% end %>
                       </select>
                     </div>
+                  </div>
+                </form>
+                
+                <div class="space-y-4">
+                  <div>
+                    <label class="block text-xs font-medium text-base-content/70 mb-1.5">📞 Target Phone Number</label>
+                    <select
+                      name="target_phone"
+                      phx-change="update_target_phone"
+                      class="w-full bg-base-200 border border-transparent focus:border-primary rounded-lg px-3 py-2.5 text-base-content text-sm focus:outline-none"
+                    >
+                      <%= for phone <- @phone_numbers do %>
+                        <option value={phone.id} selected={@target_phone_id == phone.id}>
+                          <%= phone.display_name || phone.mobile_number %>
+                        </option>
+                      <% end %>
+                    </select>
+                    <p class="mt-1 text-xs text-warning/70" :if={@target_phone_id != @cloning_template.phone_number_id}>
+                      ⚠️ Ensure media handles are valid for this WABA.
+                    </p>
                   </div>
                   
                   <div class="grid grid-cols-2 gap-4">
@@ -904,16 +1034,9 @@ defmodule TitanFlowWeb.TemplateLive.Index do
 
                 <!-- Message Body Section -->
                 <div class="space-y-4 pt-4 border-t border-base-200">
-                  <div class="flex items-center justify-between">
-                    <div class="flex items-center gap-2 text-sm font-medium text-base-content">
-                      <span class="w-5 h-5 bg-primary/20 rounded flex items-center justify-center text-xs">💬</span> 
-                      Message Body *
-                    </div>
-                    <div class="flex items-center gap-1">
-                      <button type="button" class="px-2.5 py-1 bg-primary text-primary-content text-xs font-medium rounded hover:bg-primary/90 transition-colors">+ Variable</button>
-                      <button type="button" class="px-2.5 py-1 bg-base-200 text-base-content/70 text-xs font-medium rounded hover:bg-base-300 transition-colors">B Bold</button>
-                      <button type="button" class="px-2.5 py-1 bg-base-200 text-base-content/70 text-xs font-medium rounded hover:bg-base-300 transition-colors italic">I Italic</button>
-                    </div>
+                  <div class="flex items-center gap-2 text-sm font-medium text-base-content">
+                    <span class="w-5 h-5 bg-primary/20 rounded flex items-center justify-center text-xs">💬</span> 
+                    Message Body *
                   </div>
                   
                   <textarea
@@ -1078,7 +1201,8 @@ defmodule TitanFlowWeb.TemplateLive.Index do
               </button>
               <button
                 phx-click="create_clone"
-                class="px-5 py-2.5 bg-primary text-primary-content rounded-lg font-medium text-sm hover:bg-primary/90 transition-colors shadow-sm flex items-center gap-2"
+                phx-disable-with="⏳ Creating..."
+                class="px-5 py-2.5 bg-primary text-primary-content rounded-lg font-medium text-sm hover:bg-primary/90 transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-wait active:scale-95"
               >
                 📋 Duplicate Template
               </button>
@@ -1193,6 +1317,55 @@ defmodule TitanFlowWeb.TemplateLive.Index do
                 class="px-5 py-2.5 bg-primary text-primary-content rounded-lg font-medium text-sm hover:bg-primary/90 transition-colors"
               >
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    <% end %>
+
+    <%= if @show_delete_modal && @deleting_template do %>
+      <div class="fixed inset-0 z-50 overflow-y-auto">
+        <div class="flex min-h-full items-center justify-center p-4">
+          <div class="fixed inset-0 bg-neutral/60 backdrop-blur-sm" phx-click="close_delete_modal"></div>
+          
+          <div class="relative bg-base-100 rounded-2xl shadow-xl w-full max-w-md border border-base-200">
+            <!-- Modal Header -->
+            <div class="p-5 border-b border-base-200 flex justify-between items-center bg-error/5 rounded-t-2xl">
+              <div class="flex items-center gap-3">
+                <div class="w-10 h-10 bg-error/20 rounded-lg flex items-center justify-center">
+                  <span class="text-error text-lg">⚠️</span>
+                </div>
+                <div>
+                  <h2 class="text-xl font-bold text-base-content">Delete Template</h2>
+                  <p class="text-base-content/60 text-sm">This action cannot be undone</p>
+                </div>
+              </div>
+              <button phx-click="close_delete_modal" class="w-8 h-8 flex items-center justify-center rounded-full bg-base-200 text-base-content/60 hover:bg-base-300 hover:text-base-content transition-colors">✕</button>
+            </div>
+            
+            <!-- Modal Body -->
+            <div class="p-6">
+              <p class="text-base-content">Are you sure you want to delete the template:</p>
+              <p class="mt-2 font-semibold text-lg text-base-content"><%= @deleting_template.name %></p>
+              <p class="mt-4 text-sm text-base-content/60">
+                This will remove the template from your local database. You can re-sync from Meta to restore it.
+              </p>
+            </div>
+            
+            <!-- Modal Footer -->
+            <div class="p-5 border-t border-base-200 flex items-center justify-end gap-3 bg-base-100 rounded-b-2xl">
+              <button
+                phx-click="close_delete_modal"
+                class="px-5 py-2.5 bg-base-200 text-base-content/70 rounded-lg font-medium text-sm hover:bg-base-300 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                phx-click="confirm_delete"
+                class="px-5 py-2.5 bg-error text-error-content rounded-lg font-medium text-sm hover:bg-error/90 transition-colors shadow-sm"
+              >
+                🗑️ Delete Template
               </button>
             </div>
           </div>

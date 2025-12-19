@@ -17,7 +17,7 @@ defmodule TitanFlow.Campaigns.Pipeline do
 
   alias Broadway.Message
   alias TitanFlow.WhatsApp.RateLimiter
-  alias TitanFlow.Campaigns.{Cache, Orchestrator}
+  alias TitanFlow.Campaigns.{Cache, Orchestrator, MessageTracking}
 
   @retry_delay_ms 100
   @max_retries 5
@@ -356,7 +356,6 @@ defmodule TitanFlow.Campaigns.Pipeline do
   end
 
   defp dispatch_with_retry(message, payload, phone_number_id, campaign_id, template_name, language_code, retry_count) do
-    alias TitanFlow.Campaigns.MessageTracking
     alias TitanFlow.WhatsApp.Client
     
     # Step 1: Check rate limit (fast, non-blocking)

@@ -19,108 +19,109 @@ defmodule TitanFlow.Campaigns.MessageTracking do
   @doc """
   Record a sent message - called by Pipeline when message is dispatched.
   SAFE: This function NEVER raises - always returns :ok even on failure.
-  Uses Postgres only.
+  
+  Uses Redis buffers for async batch insert (Formula 1 v2):
+  1. Push log_map to buffer:message_logs
+  2. Push history_map to buffer:contact_history  
+  3. INCR campaign:X:sent_count
   """
   def record_sent(meta_message_id, campaign_id, contact_id, recipient_phone, template_name, phone_number_id \\ nil) do
-    attrs = %{
-      meta_message_id: meta_message_id,
-      campaign_id: campaign_id,
-      contact_id: contact_id,
-      recipient_phone: recipient_phone,
-      template_name: template_name,
-      phone_number_id: phone_number_id,
-      status: "sent",
-      sent_at: DateTime.utc_now()
+    now = DateTime.utc_now()
+    
+    # Build log map for message_logs buffer
+    log_map = %{
+      "meta_message_id" => meta_message_id,
+      "campaign_id" => campaign_id,
+      "contact_id" => contact_id,
+      "recipient_phone" => recipient_phone,
+      "template_name" => template_name,
+      "phone_number_id" => phone_number_id,
+      "status" => "sent",
+      "sent_at" => DateTime.to_iso8601(now),
+      "inserted_at" => DateTime.to_iso8601(now),
+      "updated_at" => DateTime.to_iso8601(now)
     }
-
+    
+    # Build history map for contact_history buffer
+    history_map = %{
+      "phone_number" => recipient_phone,
+      "last_sent_at" => DateTime.to_iso8601(now),
+      "last_campaign_id" => campaign_id,
+      "inserted_at" => DateTime.to_iso8601(now),
+      "updated_at" => DateTime.to_iso8601(now)
+    }
+    
     try do
-      result = do_record_sent(attrs, campaign_id)
-      case result do
-        {:ok, _log} -> :ok
-        {:error, reason} ->
-          Logger.error("Failed to record sent message #{meta_message_id}: #{inspect(reason)}")
-          :ok
+      # Push to Redis buffers (async batch insert by LogBatcher)
+      push_to_buffer("buffer:message_logs", log_map)
+      
+      if recipient_phone do
+        push_to_buffer("buffer:contact_history", history_map)
       end
+      
+      # Increment sent count immediately in Redis
+      increment_campaign_counter(campaign_id, :sent_count)
+      
+      :ok
     rescue
-      Ecto.ConstraintError ->
-        # Foreign key error on contact_id - retry without it
-        Logger.warning("Foreign key error for contact_id #{contact_id}, retrying without contact_id")
-        try do
-          attrs_without_contact = Map.delete(attrs, :contact_id)
-          do_record_sent(attrs_without_contact, campaign_id)
-          :ok
-        rescue
-          e ->
-            Logger.error("Failed to record sent message (retry) #{meta_message_id}: #{inspect(e)}")
-            :ok
-        end
       e ->
-        Logger.error("Failed to record sent message #{meta_message_id}: #{inspect(e)}")
+        Logger.error("Failed to buffer sent message #{meta_message_id}: #{inspect(e)}")
         :ok
     end
   end
 
-  defp do_record_sent(attrs, campaign_id) do
-    %MessageLog{}
-    |> MessageLog.changeset(attrs)
-    |> Repo.insert(on_conflict: :nothing)
-    |> case do
-      {:ok, log} ->
-        # Increment sent count
-        increment_campaign_counter(campaign_id, :sent_count)
-        
-        # Update contact_history for instant deduplication (fire-and-forget)
-        if attrs.recipient_phone do
-          Task.start(fn -> upsert_contact_history(attrs.recipient_phone, campaign_id) end)
-        end
-        
-        {:ok, log}
-      
-      {:error, _changeset} = error ->
-        error
+  # Helper to push JSON-encoded maps to Redis buffer
+  defp push_to_buffer(buffer_key, map) do
+    case Jason.encode(map) do
+      {:ok, json} ->
+        Redix.command(:redix, ["RPUSH", buffer_key, json])
+      {:error, reason} ->
+        Logger.error("Failed to encode buffer entry: #{inspect(reason)}")
     end
   end
 
   @doc """
   Record a failed message - called by Pipeline when API returns an error.
-  This ensures failed messages are tracked in the database with error details.
-  ALSO triggers template fallback and phone rotation for critical error codes.
+  
+  Formula 1 v2 Split:
+  1. SYNC: Execute handle_error_triggers immediately (phone/template rotation)
+  2. ASYNC: Push failure log to buffer:message_logs
+  3. INCR campaign:X:failed_count
+  
   SAFE: This function NEVER raises - always returns :ok even on failure.
   """
   def record_failed(campaign_id, contact_id, recipient_phone, template_name, error_code, error_message, phone_number_id \\ nil) do
-    attrs = %{
-      meta_message_id: "failed_#{System.unique_integer([:positive])}",  # Unique ID for failed messages
-      campaign_id: campaign_id,
-      contact_id: contact_id,
-      recipient_phone: recipient_phone,
-      template_name: template_name,
-      phone_number_id: phone_number_id,
-      status: "failed",
-      error_code: to_string(error_code),  # Ensure string for matching
-      error_message: error_message,
-      sent_at: DateTime.utc_now()
-    }
-
+    now = DateTime.utc_now()
+    error_code_str = to_string(error_code)
+    
     try do
-      result = %MessageLog{}
-        |> MessageLog.changeset(attrs)
-        |> Repo.insert(on_conflict: :nothing)
+      # 1. SYNC: Handle error triggers IMMEDIATELY (blocking)
+      # This ensures phone/template rotation happens instantly before next message
+      handle_error_triggers(campaign_id, phone_number_id, error_code_str, recipient_phone, template_name)
       
-      case result do
-        {:ok, log} ->
-          # Increment failed count
-          increment_campaign_counter(campaign_id, :failed_count)
-          Logger.warning("Recorded failed message for #{recipient_phone}: #{error_code} - #{error_message}")
-          
-          # CRITICAL: Trigger template fallback / phone rotation for critical errors
-          # This handles sync API errors (132001, 132016, 132015 for templates; 131042, 131048 for phones)
-          handle_error_triggers(campaign_id, phone_number_id, error_code, log)
-          
-          :ok
-        {:error, reason} ->
-          Logger.error("Failed to record failed message: #{inspect(reason)}")
-          :ok
-      end
+      # 2. ASYNC: Push failure log to Redis buffer for batch insert
+      log_map = %{
+        "meta_message_id" => "failed_#{System.unique_integer([:positive])}",
+        "campaign_id" => campaign_id,
+        "contact_id" => contact_id,
+        "recipient_phone" => recipient_phone,
+        "template_name" => template_name,
+        "phone_number_id" => phone_number_id,
+        "status" => "failed",
+        "error_code" => error_code_str,
+        "error_message" => error_message,
+        "sent_at" => DateTime.to_iso8601(now),
+        "inserted_at" => DateTime.to_iso8601(now),
+        "updated_at" => DateTime.to_iso8601(now)
+      }
+      
+      push_to_buffer("buffer:message_logs", log_map)
+      
+      # 3. Increment failed count immediately in Redis
+      increment_campaign_counter(campaign_id, :failed_count)
+      
+      Logger.warning("Recorded failed message for #{recipient_phone}: #{error_code_str} - #{error_message}")
+      :ok
     rescue
       e ->
         Logger.error("Exception recording failed message: #{inspect(e)}")
@@ -162,13 +163,24 @@ defmodule TitanFlow.Campaigns.MessageTracking do
     error_code = Keyword.get(opts, :error_code)
     error_message = Keyword.get(opts, :error_message)
 
-    case Repo.get_by(MessageLog, meta_message_id: meta_message_id) do
+    case find_log_with_retry(meta_message_id) do
       nil ->
-        Logger.debug("Message #{meta_message_id} not found, creating new log")
-        {:ok, :not_tracked}
+        Logger.warning("Message #{meta_message_id} not found after retries (skipping #{status} update)")
+        {:ok, :not_found}
 
       log ->
         update_log_and_counters(log, status, timestamp, error_code, error_message)
+    end
+  end
+
+  defp find_log_with_retry(meta_message_id, retries \\ 3) do
+    case Repo.get_by(MessageLog, meta_message_id: meta_message_id) do
+      nil when retries > 0 ->
+        # Sleep 500ms and retry to allow LogBatcher to catch up
+        Process.sleep(500)
+        find_log_with_retry(meta_message_id, retries - 1)
+      
+      result -> result
     end
   end
 
@@ -237,8 +249,8 @@ defmodule TitanFlow.Campaigns.MessageTracking do
     failed_status = Map.get(status_counts, "failed", 0)
     
     # 3. Calculate Cumulative Counts (simulating a funnel)
-    # Total Unique Sent = Sum of all unique reachable outcomes
-    total_sent = sent_status + delivered_status + read_status + failed_status
+    # Total Unique Sent = Sent + Delivered + Read (EXCLUDING Failed)
+    total_sent = sent_status + delivered_status + read_status
     
     # Total Unique Delivered = delivered + read
     total_delivered = delivered_status + read_status
@@ -434,7 +446,10 @@ defmodule TitanFlow.Campaigns.MessageTracking do
     # Build update attrs
     attrs = %{status: status}
     attrs = if timestamp_field, do: Map.put(attrs, timestamp_field, timestamp), else: attrs
-    attrs = if error_code, do: Map.put(attrs, :error_code, error_code), else: attrs
+    # Explicitly convert error_code to string to prevent validation crashes
+    safe_error_code = if error_code, do: to_string(error_code), else: nil
+    
+    attrs = if safe_error_code, do: Map.put(attrs, :error_code, safe_error_code), else: attrs
     attrs = if error_message, do: Map.put(attrs, :error_message, error_message), else: attrs
 
     # Update the log
@@ -448,7 +463,7 @@ defmodule TitanFlow.Campaigns.MessageTracking do
       
       # Handle critical errors (Rotation / Fallback)
       if status == "failed" do
-        handle_error_triggers(log.campaign_id, log.phone_number_id, error_code, log)
+        handle_error_triggers(log.campaign_id, log.phone_number_id, error_code, log.recipient_phone, log.template_name)
       end
       
       # Check for completion if this was a terminal status
@@ -470,20 +485,21 @@ defmodule TitanFlow.Campaigns.MessageTracking do
   @error_threshold 10
   @template_error_threshold 5
 
-  defp handle_error_triggers(campaign_id, phone_number_id, error_code, log) do
+  # Updated for Formula 1 v2: accepts raw values instead of log struct
+  defp handle_error_triggers(campaign_id, phone_number_id, error_code, recipient_phone, template_name) do
     # Convert integer codes to string for consistency
     code = to_string(error_code)
 
     cond do
       code == "131026" ->
         # Smart Blacklisting
-        blacklist_contact(log.recipient_phone, campaign_id)
+        blacklist_contact(recipient_phone, campaign_id)
 
       code in @phone_rotation_codes ->
         track_phone_error(campaign_id, phone_number_id, code)
 
       code in @template_switch_codes ->
-        track_template_error(campaign_id, log.template_name)
+        track_template_error(campaign_id, template_name)
 
       true ->
         :ok
