@@ -99,24 +99,33 @@ defmodule TitanFlow.Campaigns.LogBatcher do
   # --- Message Logs Flush ---
 
   defp flush_message_logs do
-    case Redix.command(:redix, ["LPOP", "buffer:message_logs", @batch_size]) do
-      {:ok, nil} -> :ok
-      {:ok, []} -> :ok
-      {:ok, raw_entries} when is_list(raw_entries) ->
-        entries = transform_message_logs(raw_entries)
-        
-        if length(entries) > 0 do
-          case Repo.insert_all(MessageLog, entries, on_conflict: :nothing) do
-            {count, _} ->
-              Logger.debug("LogBatcher: Inserted #{count} message logs")
-            error ->
-              Logger.error("LogBatcher: Failed to insert message logs: #{inspect(error)}")
+    alias TitanFlow.Campaigns.Metrics
+    
+    Metrics.measure_log_flush(:message_logs, fn ->
+      case Redix.command(:redix, ["LPOP", "buffer:message_logs", @batch_size]) do
+        {:ok, nil} -> 0
+        {:ok, []} -> 0
+        {:ok, raw_entries} when is_list(raw_entries) ->
+          entries = transform_message_logs(raw_entries)
+          
+          if length(entries) > 0 do
+            case Repo.insert_all(MessageLog, entries, on_conflict: :nothing) do
+              {count, _} ->
+                Logger.debug("LogBatcher: Inserted #{count} message logs")
+                count
+              error ->
+                Logger.error("LogBatcher: Failed to insert message logs: #{inspect(error)}")
+                0
+            end
+          else
+            0
           end
-        end
-        
-      {:error, reason} ->
-        Logger.error("LogBatcher: Redis LPOP failed: #{inspect(reason)}")
-    end
+          
+        {:error, reason} ->
+          Logger.error("LogBatcher: Redis LPOP failed: #{inspect(reason)}")
+          0
+      end
+    end)
   end
 
   defp transform_message_logs(raw_entries) do
@@ -181,19 +190,27 @@ defmodule TitanFlow.Campaigns.LogBatcher do
   # --- Contact History Flush (Raw SQL) ---
 
   defp flush_contact_history do
-    case Redix.command(:redix, ["LPOP", "buffer:contact_history", @batch_size]) do
-      {:ok, nil} -> :ok
-      {:ok, []} -> :ok
-      {:ok, raw_entries} when is_list(raw_entries) ->
-        entries = transform_contact_history(raw_entries)
-        
-        if length(entries) > 0 do
-          execute_contact_history_upsert(entries)
-        end
-        
-      {:error, reason} ->
-        Logger.error("LogBatcher: Redis LPOP for contact_history failed: #{inspect(reason)}")
-    end
+    alias TitanFlow.Campaigns.Metrics
+    
+    Metrics.measure_log_flush(:contact_history, fn ->
+      case Redix.command(:redix, ["LPOP", "buffer:contact_history", @batch_size]) do
+        {:ok, nil} -> 0
+        {:ok, []} -> 0
+        {:ok, raw_entries} when is_list(raw_entries) ->
+          entries = transform_contact_history(raw_entries)
+          
+          if length(entries) > 0 do
+            execute_contact_history_upsert(entries)
+            length(entries)
+          else
+            0
+          end
+          
+        {:error, reason} ->
+          Logger.error("LogBatcher: Redis LPOP for contact_history failed: #{inspect(reason)}")
+          0
+      end
+    end)
   end
 
   defp transform_contact_history(raw_entries) do

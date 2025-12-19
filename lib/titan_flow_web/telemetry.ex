@@ -79,7 +79,35 @@ defmodule TitanFlowWeb.Telemetry do
       summary("vm.memory.total", unit: {:byte, :kilobyte}),
       summary("vm.total_run_queue_lengths.total"),
       summary("vm.total_run_queue_lengths.cpu"),
-      summary("vm.total_run_queue_lengths.io")
+      summary("vm.total_run_queue_lengths.io"),
+
+      # Campaign System Metrics (Phase 1: 5A)
+      summary("titan_flow.campaign.pipeline.message_processed.duration",
+        tags: [:campaign_id, :phone_number_id, :status],
+        unit: {:native, :millisecond},
+        description: "Time to process a single message in Pipeline"
+      ),
+      summary("titan_flow.campaign.buffer.refill.duration",
+        tags: [:campaign_id, :phone_number_id],
+        unit: {:native, :millisecond},
+        description: "Time to refill BufferManager from database"
+      ),
+      sum("titan_flow.campaign.buffer.refill.count",
+        tags: [:campaign_id, :phone_number_id],
+        description: "Number of contacts fetched per refill"
+      ),
+      summary("titan_flow.campaign.log_batcher.flush.duration",
+        tags: [:buffer_type],
+        unit: {:native, :millisecond},
+        description: "Time to flush log batch to database"
+      ),
+      last_value("titan_flow.campaign.queue.depth.depth",
+        tags: [:campaign_id, :phone_number_id],
+        description: "Current queue depth per phone"
+      ),
+      counter("titan_flow.campaign.pool.saturation.checkout_time_ms",
+        description: "Pool saturation alert counter"
+      )
     ]
   end
 

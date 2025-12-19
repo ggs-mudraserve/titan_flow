@@ -67,6 +67,9 @@ defmodule TitanFlow.Application do
       # Log Batcher for async message_logs and contact_history batch inserts (Formula 1 v2)
       TitanFlow.Campaigns.LogBatcher,
 
+      # Metrics Reporter for periodic system health monitoring (Phase 1: 5A + 6A)
+      TitanFlow.Campaigns.MetricsReporter,
+
       # Campaign pipelines are started dynamically when a campaign begins:
       # TitanFlow.Campaigns.Pipeline.start_link(phone_number_id: "...", template_name: "...", ...)
 
