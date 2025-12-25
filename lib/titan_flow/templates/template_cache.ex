@@ -1,21 +1,21 @@
 defmodule TitanFlow.Templates.TemplateCache do
   @moduledoc """
   Global ETS cache for template data (Phase 2: 4A).
-  
+
   ## Purpose
-  
+
   Eliminates database queries for template lookups during campaign execution.
   Templates are loaded at startup and refreshed periodically.
-  
+
   ## Cache Structure
-  
+
   ETS table `:template_cache` with entries:
   - Key: `{:by_id, template_id}` => template struct
   - Key: `{:by_name, template_name}` => template struct
   - Key: `{:by_phone, phone_number_id}` => [template structs]
-  
+
   ## Usage
-  
+
       # Get template by ID (O(1))
       TemplateCache.get(123)
       
@@ -28,22 +28,22 @@ defmodule TitanFlow.Templates.TemplateCache do
       # Force refresh (e.g., after Meta sync)
       TemplateCache.refresh()
   """
-  
+
   use GenServer
   require Logger
-  
+
   alias TitanFlow.Templates
-  alias TitanFlow.Templates.Template
-  
+
   @table_name :template_cache
-  @refresh_interval_ms 5 * 60 * 1000  # 5 minutes
-  
+  # 5 minutes
+  @refresh_interval_ms 5 * 60 * 1000
+
   # Public API
-  
+
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
-  
+
   @doc """
   Get template by ID from cache.
   Returns `{:ok, template}` or `{:error, :not_found}`.
@@ -56,7 +56,7 @@ defmodule TitanFlow.Templates.TemplateCache do
   rescue
     ArgumentError -> {:error, :cache_not_ready}
   end
-  
+
   @doc """
   Get template by name from cache.
   Returns `{:ok, template}` or `{:error, :not_found}`.
@@ -69,7 +69,7 @@ defmodule TitanFlow.Templates.TemplateCache do
   rescue
     ArgumentError -> {:error, :cache_not_ready}
   end
-  
+
   @doc """
   Get all templates for a phone number from cache.
   Returns list of templates (may be empty).
@@ -82,7 +82,7 @@ defmodule TitanFlow.Templates.TemplateCache do
   rescue
     ArgumentError -> []
   end
-  
+
   @doc """
   Get all approved templates for a phone number.
   """
@@ -91,14 +91,14 @@ defmodule TitanFlow.Templates.TemplateCache do
     |> get_by_phone()
     |> Enum.filter(&(&1.status == "APPROVED"))
   end
-  
+
   @doc """
   Force refresh the cache from database.
   """
   def refresh do
     GenServer.call(__MODULE__, :refresh, 30_000)
   end
-  
+
   @doc """
   Invalidate a specific template (e.g., from webhook).
   The template will be refetched from DB on next refresh.
@@ -106,13 +106,15 @@ defmodule TitanFlow.Templates.TemplateCache do
   def invalidate(template_id) when is_integer(template_id) do
     GenServer.cast(__MODULE__, {:invalidate, template_id})
   end
-  
+
   @doc """
   Get cache stats for monitoring.
   """
   def stats do
     case :ets.info(@table_name) do
-      :undefined -> %{size: 0, memory: 0, status: :not_ready}
+      :undefined ->
+        %{size: 0, memory: 0, status: :not_ready}
+
       info ->
         %{
           size: Keyword.get(info, :size, 0),
@@ -121,31 +123,31 @@ defmodule TitanFlow.Templates.TemplateCache do
         }
     end
   end
-  
+
   # GenServer Callbacks
-  
+
   @impl true
   def init(_opts) do
     # Create ETS table owned by this process
     :ets.new(@table_name, [:named_table, :set, :public, read_concurrency: true])
-    
+
     Logger.info("TemplateCache: Starting, loading templates...")
-    
+
     # Load templates synchronously on startup
     load_all_templates()
-    
+
     # Schedule periodic refresh
     schedule_refresh()
-    
+
     {:ok, %{last_refresh: System.monotonic_time(:second)}}
   end
-  
+
   @impl true
   def handle_call(:refresh, _from, state) do
     count = load_all_templates()
     {:reply, {:ok, count}, %{state | last_refresh: System.monotonic_time(:second)}}
   end
-  
+
   @impl true
   def handle_cast({:invalidate, template_id}, state) do
     # Remove the invalidated template from cache
@@ -153,36 +155,36 @@ defmodule TitanFlow.Templates.TemplateCache do
     Logger.debug("TemplateCache: Invalidated template #{template_id}")
     {:noreply, state}
   end
-  
+
   @impl true
   def handle_info(:refresh, state) do
     load_all_templates()
     schedule_refresh()
     {:noreply, %{state | last_refresh: System.monotonic_time(:second)}}
   end
-  
+
   # Private Functions
-  
+
   defp schedule_refresh do
     Process.send_after(self(), :refresh, @refresh_interval_ms)
   end
-  
+
   defp load_all_templates do
     templates = Templates.list_templates()
-    
+
     # Clear existing entries
     :ets.delete_all_objects(@table_name)
-    
+
     # Index by ID
     Enum.each(templates, fn template ->
       :ets.insert(@table_name, {{:by_id, template.id}, template})
     end)
-    
+
     # Index by name
     Enum.each(templates, fn template ->
       :ets.insert(@table_name, {{:by_name, template.name}, template})
     end)
-    
+
     # Index by phone_number_id
     templates
     |> Enum.filter(& &1.phone_number_id)
@@ -190,7 +192,7 @@ defmodule TitanFlow.Templates.TemplateCache do
     |> Enum.each(fn {phone_id, phone_templates} ->
       :ets.insert(@table_name, {{:by_phone, phone_id}, phone_templates})
     end)
-    
+
     count = length(templates)
     Logger.info("TemplateCache: Loaded #{count} templates into cache")
     count

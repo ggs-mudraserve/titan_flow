@@ -63,8 +63,7 @@ defmodule TitanFlow.WhatsApp.MediaUploader do
       multipart =
         {:multipart,
          [
-           {:file, file_binary,
-            {"form-data", [{"name", "file"}, {"filename", file_name}]},
+           {:file, file_binary, {"form-data", [{"name", "file"}, {"filename", file_name}]},
             [{"content-type", mime_type}]},
            {"messaging_product", "whatsapp"},
            {"type", get_media_type(mime_type)}

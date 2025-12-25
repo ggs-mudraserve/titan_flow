@@ -10,8 +10,6 @@ defmodule TitanFlowWeb.WebhookController do
 
   require Logger
 
-
-
   @doc """
   GET /api/webhooks/whatsapp - Webhook verification for Meta
   """
@@ -31,15 +29,56 @@ defmodule TitanFlowWeb.WebhookController do
 
   @doc """
   POST /api/webhooks/whatsapp - Webhook ingestion for Meta
+
+  Security: Verifies x-hub-signature-256 header using Meta app secret.
   """
   def handle(conn, params) do
-    # Always return 200 OK immediately to keep Meta happy
-    # Process in background using supervised task (Phase 4: 5B)
-    Task.Supervisor.start_child(TitanFlow.TaskSupervisor, fn -> process_webhook(params) end)
+    # SECURITY: Verify webhook signature before processing
+    if verify_signature(conn) do
+      # Always return 200 OK immediately to keep Meta happy
+      # Process in background using supervised task (Phase 4: 5B)
+      Task.Supervisor.start_child(TitanFlow.TaskSupervisor, fn -> process_webhook(params) end)
 
-    conn
-    |> put_status(200)
-    |> json(%{status: "ok"})
+      conn
+      |> put_status(200)
+      |> json(%{status: "ok"})
+    else
+      Logger.warning("Webhook signature verification failed - rejecting request")
+
+      conn
+      |> put_status(401)
+      |> json(%{error: "Invalid signature"})
+    end
+  end
+
+  # Verify Meta webhook signature using HMAC-SHA256
+  defp verify_signature(conn) do
+    app_secret = Application.get_env(:titan_flow, :meta_app_secret)
+
+    # If no app secret configured, skip verification (dev mode)
+    if is_nil(app_secret) or app_secret == "" do
+      Logger.warning("Webhook signature verification SKIPPED - meta_app_secret not configured")
+      true
+    else
+      signature_header = get_req_header(conn, "x-hub-signature-256") |> List.first()
+
+      if is_nil(signature_header) do
+        Logger.warning("Missing x-hub-signature-256 header")
+        false
+      else
+        # The raw body is stored by Plug.Parsers via body_reader
+        raw_body = conn.assigns[:raw_body] || ""
+
+        # Compute expected signature
+        expected =
+          "sha256=" <>
+            (:crypto.mac(:hmac, :sha256, app_secret, raw_body)
+             |> Base.encode16(case: :lower))
+
+        # Constant-time comparison to prevent timing attacks
+        Plug.Crypto.secure_compare(signature_header, expected)
+      end
+    end
   end
 
   defp get_verify_token do
@@ -52,7 +91,14 @@ defmodule TitanFlowWeb.WebhookController do
       Enum.each(changes, &process_change/1)
     end)
   end
+
   defp process_webhook(_), do: :ok
+
+  defp process_change(%{"value" => value, "field" => "template_category_update"}) do
+    # Handle template category change webhooks (UTILITY -> MARKETING, etc.)
+    # Meta sends these when a template's category is changed
+    handle_template_category_update(value)
+  end
 
   defp process_change(%{"value" => value, "field" => "message_template_status_update"}) do
     # Handle template quality/status webhooks
@@ -71,7 +117,46 @@ defmodule TitanFlowWeb.WebhookController do
       handle_messages(messages, value)
     end
   end
+
   defp process_change(_), do: :ok
+
+  # Handle template category change webhooks (e.g., UTILITY -> MARKETING)
+  defp handle_template_category_update(value) do
+    template_name = value["message_template_name"] || value["templateName"]
+    previous_category = value["previousCategory"] || value["previous_category"]
+    new_category = value["newCategory"] || value["new_category"]
+
+    Logger.warning(
+      "Template category change: #{template_name} -> #{previous_category} to #{new_category}"
+    )
+
+    # Fetch template from DB
+    case TitanFlow.Templates.get_template_by_name(template_name) do
+      nil ->
+        Logger.warning("Category update received for unknown template: #{template_name}")
+        :ok
+
+      db_template ->
+        # Update category in DB
+        TitanFlow.Templates.update_template(db_template, %{category: new_category})
+
+        # Invalidate ETS cache
+        TitanFlow.Templates.TemplateCache.invalidate(db_template.id)
+
+        # If changed from UTILITY to MARKETING (or to any non-UTILITY), mark as paused
+        if previous_category == "UTILITY" and new_category != "UTILITY" do
+          alias TitanFlow.Campaigns.Cache
+          Cache.mark_template_paused(template_name)
+
+          Logger.warning(
+            "Template #{template_name} changed from UTILITY to #{new_category} - marked as PAUSED"
+          )
+
+          # Trigger fallback for all affected campaigns
+          QualityMonitor.switch_template(db_template.id)
+        end
+    end
+  end
 
   # Handle template quality/status webhooks for late-binding template switching
   defp handle_template_status_update(value) do
@@ -79,49 +164,61 @@ defmodule TitanFlowWeb.WebhookController do
     template_name = value["message_template_name"]
     new_status = value["message_template_status"]
     new_category = value["message_template_category"]
-    
-    Logger.info("Template update: #{template_name} -> Status: #{new_status}, Category: #{new_category} (event: #{event})")
-    
+
+    Logger.info(
+      "Template update: #{template_name} -> Status: #{new_status}, Category: #{new_category} (event: #{event})"
+    )
+
     # Fetch template from DB to compare
     case TitanFlow.Templates.get_template_by_name(template_name) do
       nil ->
         Logger.warning("Template update received for unknown template: #{template_name}")
         :ok
-        
+
       db_template ->
         # Check for status degradation or category change
-        should_switch = cond do
-          should_trigger_fallback?(new_status) ->
-            Logger.warning("Template #{template_name}: Status degraded to #{new_status}")
-            true
-            
-          new_category != nil and new_category != db_template.category ->
-            Logger.warning("Template #{template_name}: Category changed from #{db_template.category} to #{new_category}")
-            true
-            
-          new_status != "APPROVED" and db_template.status == "APPROVED" ->
-            Logger.warning("Template #{template_name}: Status no longer APPROVED (was: #{db_template.status}, now: #{new_status})")
-            true
-            
-          true ->
-            false
-        end
-        
+        should_switch =
+          cond do
+            should_trigger_fallback?(new_status) ->
+              Logger.warning("Template #{template_name}: Status degraded to #{new_status}")
+              true
+
+            new_category != nil and new_category != db_template.category ->
+              Logger.warning(
+                "Template #{template_name}: Category changed from #{db_template.category} to #{new_category}"
+              )
+
+              true
+
+            new_status != "APPROVED" and db_template.status == "APPROVED" ->
+              Logger.warning(
+                "Template #{template_name}: Status no longer APPROVED (was: #{db_template.status}, now: #{new_status})"
+              )
+
+              true
+
+            true ->
+              false
+          end
+
         if should_switch do
           # Update template in DB
           TitanFlow.Templates.update_template(db_template, %{
             status: new_status,
             category: new_category || db_template.category
           })
-          
+
           # Invalidate ETS cache so Pipeline picks up the change (Phase 4: 4C)
           TitanFlow.Templates.TemplateCache.invalidate(db_template.id)
-          
+
           # Cache the paused status in Redis for fast Pipeline pre-flight check
           alias TitanFlow.Campaigns.Cache
           Cache.mark_template_paused(template_name)
-          Logger.warning("Template #{template_name} marked as PAUSED in Redis cache and ETS invalidated")
-          
+
+          Logger.warning(
+            "Template #{template_name} marked as PAUSED in Redis cache and ETS invalidated"
+          )
+
           # Trigger switch for all affected campaigns
           QualityMonitor.switch_template(db_template.id)
         else
@@ -130,7 +227,7 @@ defmodule TitanFlowWeb.WebhookController do
             status: new_status,
             category: new_category || db_template.category
           })
-          
+
           # Clear paused cache if template is now approved
           if new_status == "APPROVED" do
             alias TitanFlow.Campaigns.Cache
@@ -144,46 +241,28 @@ defmodule TitanFlowWeb.WebhookController do
     status in ["PAUSED", "FLAGGED", "DISABLED", "REJECTED"]
   end
 
-  defp trigger_fallback_for_template(template_name, webhook_status) do
-    # Get all active campaigns - for each one using this template, trigger fallback switch
-    # Note: In production, you'd want to query campaigns by template_name more efficiently
-    campaigns = TitanFlow.Campaigns.list_campaigns()
-    
-    Enum.each(campaigns, fn campaign ->
-      case campaign.status do
-        campaign_status when campaign_status in ["running", "importing", "ready"] ->
-          # Check if this campaign is affected by querying the cache
-          case TitanFlow.Campaigns.Cache.get_active_template(campaign.id) do
-            {:ok, %{template_name: ^template_name}} ->
-              Logger.warning("Campaign #{campaign.id}: Template #{template_name} status changed to #{webhook_status}, switching to fallback")
-              QualityMonitor.switch_template_if_needed(campaign.id, webhook_status, template_name)
-            _ ->
-              :ok  # This campaign uses a different template
-          end
-        _ ->
-          :ok  # Campaign not active
-      end
-    end)
-  end
+  # DELETED: trigger_fallback_for_template/2 - was dead code referencing missing functions\n  # Legacy active-template switching removed; Pipeline now handles fallback per-message
 
   # Handle status updates (sent/delivered/read/failed)
-  defp handle_statuses(statuses, value) do
-    phone_number_id = get_in(value, ["metadata", "phone_number_id"])
-    
-    alias TitanFlow.Campaigns.MessageTracking
-    
+  defp handle_statuses(statuses, _value) do
+    # P2 FIX: Use WebhookBatcher for batched DB updates instead of direct writes
+    alias TitanFlow.Campaigns.WebhookBatcher
+
     Enum.each(statuses, fn status ->
       message_id = status["id"]
       message_status = status["status"]
-      timestamp = parse_timestamp(status["timestamp"])
+      # Keep as string, batcher will parse
+      timestamp = status["timestamp"]
       error_code = get_in(status, ["errors", Access.at(0), "code"])
       error_message = get_in(status, ["errors", Access.at(0), "message"])
-      
-      # Update message tracking (connects to campaign statistics)
-      MessageTracking.update_status(message_id, message_status,
-        timestamp: timestamp,
-        error_code: error_code,
-        error_message: error_message
+
+      # Queue for batch processing (returns immediately, no DB blocking)
+      WebhookBatcher.queue_status_update(
+        message_id,
+        message_status,
+        timestamp,
+        error_code,
+        error_message
       )
     end)
   end
@@ -196,7 +275,7 @@ defmodule TitanFlowWeb.WebhookController do
     # CACHED lookup - eliminates DB query after first hit
     alias TitanFlow.WhatsApp.PhoneCache
     phone_db_id = PhoneCache.get_db_id(phone_number_id)
-    
+
     if is_nil(phone_db_id) do
       Logger.warning("Webhook: Unknown phone_number_id: #{phone_number_id}")
     else
@@ -219,16 +298,16 @@ defmodule TitanFlowWeb.WebhookController do
       {:ok, conversation} ->
         # DEDUP: Create message with conflict handling - single query with on_conflict
         case Inbox.create_message_dedup(%{
-          conversation_id: conversation.id,
-          direction: "inbound",
-          content: content,
-          message_type: msg["type"] || "text",
-          meta_message_id: meta_message_id
-        }) do
+               conversation_id: conversation.id,
+               direction: "inbound",
+               content: content,
+               message_type: msg["type"] || "text",
+               meta_message_id: meta_message_id
+             }) do
           {:ok, message} ->
             # Update conversation preview (single UPDATE query)
             Inbox.update_conversation_preview(conversation.id, content)
-            
+
             # Broadcast to PubSub for real-time UI updates
             Inbox.broadcast_new_message(message, conversation)
 
@@ -242,14 +321,14 @@ defmodule TitanFlowWeb.WebhookController do
 
             # Record reply for campaign tracking (single UPDATE query)
             TitanFlow.Campaigns.MessageTracking.record_reply(phone_number_id, contact_phone)
-            
+
           {:duplicate, _} ->
             Logger.debug("Skipping duplicate message: #{meta_message_id}")
-            
+
           {:error, changeset} ->
             Logger.error("Failed to create message: #{inspect(changeset.errors)}")
         end
-        
+
       {:error, reason} ->
         Logger.error("Failed to upsert conversation: #{inspect(reason)}")
     end
@@ -257,30 +336,15 @@ defmodule TitanFlowWeb.WebhookController do
 
   defp extract_message_content(%{"type" => "text", "text" => %{"body" => body}}), do: body
   defp extract_message_content(%{"type" => "button", "button" => %{"text" => text}}), do: text
+
   defp extract_message_content(%{"type" => "interactive", "interactive" => interactive}) do
-    get_in(interactive, ["button_reply", "title"]) || 
-    get_in(interactive, ["list_reply", "title"]) ||
-    "[Interactive reply]"
+    get_in(interactive, ["button_reply", "title"]) ||
+      get_in(interactive, ["list_reply", "title"]) ||
+      "[Interactive reply]"
   end
+
   defp extract_message_content(%{"type" => type}), do: "[#{type} message]"
   defp extract_message_content(_), do: "[Unknown message]"
 
-  defp get_phone_number_db_id(phone_number_id) do
-    case TitanFlow.WhatsApp.get_by_phone_number_id(phone_number_id) do
-      nil -> nil
-      phone -> phone.id
-    end
-  end
-
-  defp parse_timestamp(nil), do: DateTime.utc_now()
-  defp parse_timestamp(ts) when is_binary(ts) do
-    case Integer.parse(ts) do
-      {unix, _} -> DateTime.from_unix!(unix)
-      :error -> DateTime.utc_now()
-    end
-  end
-  defp parse_timestamp(ts) when is_integer(ts), do: DateTime.from_unix!(ts)
-
   # ClickHouse logging removed - all logging now done via MessageTracking to Postgres
 end
-

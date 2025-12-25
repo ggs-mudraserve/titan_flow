@@ -2,8 +2,8 @@ defmodule TitanFlowWeb.InboxLive.Index do
   use TitanFlowWeb, :live_view
 
   alias TitanFlow.Inbox
-  alias TitanFlow.Inbox.{Conversation, Message}
   alias TitanFlow.Templates
+  alias TitanFlowWeb.DateTimeHelpers
 
   @conversations_per_page 20
   @messages_per_load 50
@@ -42,18 +42,19 @@ defmodule TitanFlowWeb.InboxLive.Index do
   @impl true
   def handle_event("search", %{"term" => term}, socket) do
     socket = assign(socket, search_term: term, conversations_page: 1)
-    
-    page = if term == "" do
-      Inbox.list_conversations(1, @conversations_per_page)
-    else
-      Inbox.search_conversations(term, 1, @conversations_per_page)
-    end
-    
+
+    page =
+      if term == "" do
+        Inbox.list_conversations(1, @conversations_per_page)
+      else
+        Inbox.search_conversations(term, 1, @conversations_per_page)
+      end
+
     socket =
       socket
       |> assign(conversations_total_pages: page.total_pages)
       |> stream(:conversations, page.entries, reset: true)
-    
+
     {:noreply, socket}
   end
 
@@ -61,21 +62,26 @@ defmodule TitanFlowWeb.InboxLive.Index do
   def handle_event("load_more_conversations", _params, socket) do
     current_page = socket.assigns.conversations_page
     total_pages = socket.assigns.conversations_total_pages
-    
+
     if current_page < total_pages do
       next_page = current_page + 1
-      
-      page = if socket.assigns.search_term == "" do
-        Inbox.list_conversations(next_page, @conversations_per_page)
-      else
-        Inbox.search_conversations(socket.assigns.search_term, next_page, @conversations_per_page)
-      end
-      
+
+      page =
+        if socket.assigns.search_term == "" do
+          Inbox.list_conversations(next_page, @conversations_per_page)
+        else
+          Inbox.search_conversations(
+            socket.assigns.search_term,
+            next_page,
+            @conversations_per_page
+          )
+        end
+
       socket =
         socket
         |> assign(conversations_page: next_page)
         |> stream(:conversations, page.entries)
-      
+
       {:noreply, socket}
     else
       {:noreply, socket}
@@ -85,18 +91,18 @@ defmodule TitanFlowWeb.InboxLive.Index do
   @impl true
   def handle_event("select_conversation", %{"id" => id}, socket) do
     conversation = Inbox.get_conversation!(id)
-    
+
     # Mark as read
     Inbox.mark_as_read(conversation.id)
-    
+
     # Load last 50 messages
     messages = Inbox.list_messages(conversation.id, @messages_per_load, 0)
     total_count = Inbox.count_messages(conversation.id)
     has_more = length(messages) < total_count
-    
+
     # Load templates for picker
     templates = Templates.list_templates()
-    
+
     socket =
       socket
       |> assign(active_conversation: conversation)
@@ -106,7 +112,7 @@ defmodule TitanFlowWeb.InboxLive.Index do
       |> stream(:messages, messages, reset: true)
       # Update the conversation in sidebar to reset unread count
       |> stream_insert(:conversations, %{conversation | unread_count: 0})
-    
+
     {:noreply, socket}
   end
 
@@ -114,11 +120,11 @@ defmodule TitanFlowWeb.InboxLive.Index do
   def handle_event("load_older", _params, socket) do
     conversation = socket.assigns.active_conversation
     offset = socket.assigns.messages_offset
-    
+
     socket = assign(socket, loading_more: true)
-    
+
     messages = Inbox.list_messages(conversation.id, @messages_per_load, offset)
-    
+
     if Enum.empty?(messages) do
       {:noreply, assign(socket, has_more_messages: false, loading_more: false)}
     else
@@ -128,12 +134,13 @@ defmodule TitanFlowWeb.InboxLive.Index do
         |> assign(messages_offset: offset + length(messages))
         |> assign(loading_more: false)
         |> assign(has_more_messages: length(messages) == @messages_per_load)
-      
+
       # Insert at position 0 (prepend)
-      socket = Enum.reduce(messages, socket, fn msg, acc ->
-        stream_insert(acc, :messages, msg, at: 0)
-      end)
-      
+      socket =
+        Enum.reduce(messages, socket, fn msg, acc ->
+          stream_insert(acc, :messages, msg, at: 0)
+        end)
+
       {:noreply, socket}
     end
   end
@@ -144,57 +151,59 @@ defmodule TitanFlowWeb.InboxLive.Index do
   end
 
   @impl true
-  @impl true
   def handle_event("send_message", _params, socket) do
     conversation = socket.assigns.active_conversation
     content = socket.assigns.message_input
-    
+
     if conversation && content != "" do
       # 1. Create local message first
-      {:ok, message} = Inbox.create_message(%{
-        conversation_id: conversation.id,
-        direction: "outbound",
-        content: content,
-        status: "pending"
-      })
-      
+      {:ok, message} =
+        Inbox.create_message(%{
+          conversation_id: conversation.id,
+          direction: "outbound",
+          content: content,
+          status: "pending"
+        })
+
       socket =
         socket
         |> assign(message_input: "")
         |> stream_insert(:messages, message)
-      
+
       # 2. Spawn task to send via WhatsApp API
       # Using Task.start to verify it works without blocking UI, 
       # but ideally we should handle result to update UI
       # We'll do it synchronously here for feedback for now since it's a live chat
-      
+
       phone = conversation.phone_number
-      
-      send_result = TitanFlow.WhatsApp.Client.send_text(
-        phone.phone_number_id,
-        conversation.contact_phone,
-        content,
-        phone.access_token
-      )
-      
+
+      send_result =
+        TitanFlow.WhatsApp.Client.send_text(
+          phone.phone_number_id,
+          conversation.contact_phone,
+          content,
+          phone.access_token
+        )
+
       case send_result do
         {:ok, response} ->
           # Extract message ID
           meta_id = get_in(response, ["messages", Access.at(0), "id"])
-          
+
           # Update message status
           {:ok, updated_message} = Inbox.update_message_status(message.id, "sent", meta_id)
-          
+
           {:noreply, stream_insert(socket, :messages, updated_message)}
-          
+
         {:error, reason} ->
           # Update to failed
-          {:ok, failed_message} = Inbox.update_message_status(message.id, "failed", nil, inspect(reason))
-          
-          {:noreply, 
-            socket 
-            |> put_flash(:error, "Failed to send message")
-            |> stream_insert(:messages, failed_message)}
+          {:ok, failed_message} =
+            Inbox.update_message_status(message.id, "failed", nil, inspect(reason))
+
+          {:noreply,
+           socket
+           |> put_flash(:error, "Failed to send message")
+           |> stream_insert(:messages, failed_message)}
       end
     else
       {:noreply, socket}
@@ -204,13 +213,15 @@ defmodule TitanFlowWeb.InboxLive.Index do
   @impl true
   def handle_event("toggle_ai", _params, socket) do
     conversation = socket.assigns.active_conversation
-    
+
     if conversation do
       {:ok, updated} = Inbox.toggle_ai_pause(conversation.id)
+
       socket =
         socket
         |> assign(active_conversation: updated)
         |> stream_insert(:conversations, updated)
+
       {:noreply, socket}
     else
       {:noreply, socket}
@@ -224,9 +235,10 @@ defmodule TitanFlowWeb.InboxLive.Index do
 
   @impl true
   def handle_event("select_template", %{"name" => name}, socket) do
-    {:noreply, socket
-      |> assign(message_input: "[Template: #{name}]")
-      |> assign(show_template_picker: false)}
+    {:noreply,
+     socket
+     |> assign(message_input: "[Template: #{name}]")
+     |> assign(show_template_picker: false)}
   end
 
   # PubSub Handler
@@ -234,32 +246,30 @@ defmodule TitanFlowWeb.InboxLive.Index do
   @impl true
   def handle_info({:new_message, message, conversation}, socket) do
     active = socket.assigns.active_conversation
-    
-    socket = if active && active.id == conversation.id do
-      # Message for active chat - add to stream
-      stream_insert(socket, :messages, message)
-    else
-      # Message for different chat - update sidebar
-      # Increment unread and move to top
-      updated_conv = %{conversation | unread_count: conversation.unread_count + 1}
-      socket
-      |> stream_delete(:conversations, conversation)
-      |> stream_insert(:conversations, updated_conv, at: 0)
-    end
-    
+
+    socket =
+      if active && active.id == conversation.id do
+        # Message for active chat - add to stream
+        stream_insert(socket, :messages, message)
+      else
+        # Message for different chat - update sidebar
+        # Increment unread and move to top
+        updated_conv = %{conversation | unread_count: conversation.unread_count + 1}
+
+        socket
+        |> stream_delete(:conversations, conversation)
+        |> stream_insert(:conversations, updated_conv, at: 0)
+      end
+
     {:noreply, socket}
   end
 
   # Helpers
 
   defp format_time(nil), do: ""
-  defp format_time(datetime) do
-    Calendar.strftime(datetime, "%H:%M")
-  end
 
-  defp format_date(nil), do: ""
-  defp format_date(datetime) do
-    Calendar.strftime(datetime, "%b %d")
+  defp format_time(datetime) do
+    DateTimeHelpers.format_short_datetime(datetime)
   end
 
   @impl true

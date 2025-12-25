@@ -3,7 +3,7 @@ defmodule TitanFlow.Repo.Migrations.CreateContactHistory do
 
   @doc """
   Creates the contact_history table for instant 30-day deduplication.
-  
+
   This is a lightweight "Master History Table" that tracks the last time
   each phone number was contacted. Much faster than scanning message_logs.
   """

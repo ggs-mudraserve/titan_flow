@@ -8,7 +8,8 @@ config :titan_flow, TitanFlow.Repo,
   database: "titan_flow_dev",
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
-  prepare: :unnamed,  # Supavisor Transaction Mode compatible
+  # Supavisor Transaction Mode compatible
+  prepare: :unnamed,
   pool_size: 10
 
 # For development, we disable any cache and enable
@@ -64,4 +65,3 @@ config :phoenix, :stacktrace_depth, 20
 
 # Initialize plugs at runtime for faster development compilation
 config :phoenix, :plug_init_mode, :runtime
-

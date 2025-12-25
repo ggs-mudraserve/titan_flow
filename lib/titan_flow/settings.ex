@@ -2,7 +2,6 @@ defmodule TitanFlow.Settings do
   @moduledoc """
   Context for managing global application settings.
   """
-  import Ecto.Query
   alias TitanFlow.Repo
   alias TitanFlow.Settings.ConfigEntry
 
@@ -21,7 +20,7 @@ defmodule TitanFlow.Settings do
   """
   def set_value(key, value) do
     entry = Repo.get(ConfigEntry, key) || %ConfigEntry{key: key}
-    
+
     entry
     |> ConfigEntry.changeset(%{value: value})
     |> Repo.insert_or_update()

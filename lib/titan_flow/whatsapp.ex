@@ -77,7 +77,7 @@ defmodule TitanFlow.WhatsApp do
       {:ok, %Req.Response{status: 200, body: body}} ->
         quality_rating = get_in(body, ["quality_rating"]) || "GREEN"
         display_name = get_in(body, ["verified_name"]) || get_in(body, ["display_phone_number"])
-        
+
         update_phone_number(phone_number, %{
           quality_rating: quality_rating,
           display_name: display_name
@@ -89,5 +89,13 @@ defmodule TitanFlow.WhatsApp do
       {:error, reason} ->
         {:error, {:request_failed, reason}}
     end
+  end
+
+  @doc """
+  Sync templates for a specific phone number (wrapper for Templates.sync_templates_for_waba).
+  """
+  def sync_templates(phone_id) do
+    phone_number = get_phone_number!(phone_id)
+    TitanFlow.Templates.sync_templates_for_waba(phone_number)
   end
 end

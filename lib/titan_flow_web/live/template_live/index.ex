@@ -2,9 +2,9 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   use TitanFlowWeb, :live_view
 
   alias TitanFlow.Templates
-  alias TitanFlow.Templates.Template
   alias TitanFlow.WhatsApp
   alias TitanFlow.WhatsApp.MediaUploader
+  alias TitanFlowWeb.DateTimeHelpers
 
   @impl true
   def mount(_params, _session, socket) do
@@ -39,12 +39,13 @@ defmodule TitanFlowWeb.TemplateLive.Index do
       |> assign(total: 0)
       |> assign(target_phone_id: nil)
       |> assign(phone_numbers: WhatsApp.list_phone_numbers())
-      |> allow_upload(:header_media, 
-           accept: ~w(.jpg .jpeg .png .mp4 .3gp .pdf), 
-           max_entries: 1, 
-           max_file_size: 16_000_000,
-           auto_upload: true,
-           progress: &handle_progress/3)
+      |> allow_upload(:header_media,
+        accept: ~w(.jpg .jpeg .png .mp4 .3gp .pdf),
+        max_entries: 1,
+        max_file_size: 16_000_000,
+        auto_upload: true,
+        progress: &handle_progress/3
+      )
       |> load_templates()
 
     {:ok, socket}
@@ -56,7 +57,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
     Logger.info("Template sync started")
     socket = assign(socket, syncing: true)
     parent = self()
-    
+
     Task.start(fn ->
       try do
         Logger.info("Template sync Task running...")
@@ -69,69 +70,36 @@ defmodule TitanFlowWeb.TemplateLive.Index do
           send(parent, {:sync_complete, {:error, e}})
       end
     end)
-    
+
     {:noreply, socket}
-  end
-
-  @impl true
-  def handle_info({:sync_complete, result}, socket) do
-    socket = assign(socket, syncing: false)
-    
-    socket = case result do
-      {:ok, count} ->
-        socket
-        |> put_flash(:info, "Synced #{count} templates from Meta!")
-        |> load_templates()
-      {:error, :no_phone_numbers} ->
-        put_flash(socket, :error, "No phone numbers configured. Add a phone number first.")
-      {:error, reason} ->
-        put_flash(socket, :error, "Sync failed: #{inspect(reason)}")
-    end
-    
-    {:noreply, socket}
-  end
-
-  @impl true
-  def handle_info({:upload_complete, handle, filename, media_type}, socket) do
-    {:noreply, socket
-      |> assign(media_handle: handle)
-      |> assign(uploaded_file: filename)
-      |> assign(media_type: media_type)
-      |> assign(uploading: false)}
-  end
-
-  @impl true
-  def handle_info({:upload_error, reason}, socket) do
-    {:noreply, socket
-      |> assign(upload_error: "Upload failed: #{inspect(reason)}")
-      |> assign(uploading: false)}
   end
 
   @impl true
   def handle_event("open_clone_modal", %{"id" => id}, socket) do
     template = Templates.get_template!(id)
     body_text = extract_body_text(template.components)
-    
+
     timestamp = System.system_time(:second)
-    
+
     # Detect original header type
     original_header_type = detect_header_type(template.components)
-    
-    {:noreply, socket
-      |> assign(show_clone_modal: true)
-      |> assign(cloning_template: template)
-      |> assign(clone_name: "#{template.name}_copy_#{timestamp}")
-      |> assign(clone_body_text: body_text)
-      |> assign(clone_language: template.language || "en_US")
-      |> assign(clone_buttons: extract_buttons(template.components))
-      |> assign(clone_variables: extract_variables(body_text))
-      |> assign(variable_values: %{})
-      |> assign(target_phone_id: template.phone_number_id)
-      |> assign(media_handle: nil)
-      |> assign(uploaded_file: nil)
-      |> assign(media_type: nil)
-      |> assign(header_type: original_header_type)
-      |> assign(upload_error: nil)}
+
+    {:noreply,
+     socket
+     |> assign(show_clone_modal: true)
+     |> assign(cloning_template: template)
+     |> assign(clone_name: "#{template.name}_copy_#{timestamp}")
+     |> assign(clone_body_text: body_text)
+     |> assign(clone_language: template.language || "en_US")
+     |> assign(clone_buttons: extract_buttons(template.components))
+     |> assign(clone_variables: extract_variables(body_text))
+     |> assign(variable_values: %{})
+     |> assign(target_phone_id: template.phone_number_id)
+     |> assign(media_handle: nil)
+     |> assign(uploaded_file: nil)
+     |> assign(media_type: nil)
+     |> assign(header_type: original_header_type)
+     |> assign(upload_error: nil)}
   end
 
   @impl true
@@ -142,9 +110,11 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   @impl true
   def handle_event("open_preview_modal", %{"id" => id}, socket) do
     template = Templates.get_template!(id)
-    {:noreply, socket
-      |> assign(show_preview_modal: true)
-      |> assign(preview_template: template)}
+
+    {:noreply,
+     socket
+     |> assign(show_preview_modal: true)
+     |> assign(preview_template: template)}
   end
 
   @impl true
@@ -155,9 +125,11 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   @impl true
   def handle_event("open_delete_modal", %{"id" => id}, socket) do
     template = Templates.get_template!(id)
-    {:noreply, socket
-      |> assign(show_delete_modal: true)
-      |> assign(deleting_template: template)}
+
+    {:noreply,
+     socket
+     |> assign(show_delete_modal: true)
+     |> assign(deleting_template: template)}
   end
 
   @impl true
@@ -168,17 +140,20 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   @impl true
   def handle_event("confirm_delete", _params, socket) do
     template = socket.assigns.deleting_template
-    
+
     case Templates.delete_template(template) do
       {:ok, _} ->
-        {:noreply, socket
-          |> put_flash(:info, "Template '#{template.name}' deleted successfully.")
-          |> assign(show_delete_modal: false, deleting_template: nil)
-          |> load_templates()}
+        {:noreply,
+         socket
+         |> put_flash(:info, "Template '#{template.name}' deleted successfully.")
+         |> assign(show_delete_modal: false, deleting_template: nil)
+         |> load_templates()}
+
       {:error, _} ->
-        {:noreply, socket
-          |> put_flash(:error, "Failed to delete template.")
-          |> assign(show_delete_modal: false, deleting_template: nil)}
+        {:noreply,
+         socket
+         |> put_flash(:error, "Failed to delete template.")
+         |> assign(show_delete_modal: false, deleting_template: nil)}
     end
   end
 
@@ -186,11 +161,12 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   def handle_event("update_clone_form", params, socket) do
     require Logger
     Logger.debug("update_clone_form params: #{inspect(params)}")
-    
-    socket = socket
+
+    socket =
+      socket
       |> assign(clone_name: params["clone_name"] || socket.assigns.clone_name)
       |> assign(clone_language: params["clone_language"] || socket.assigns.clone_language)
-    
+
     {:noreply, socket}
   end
 
@@ -201,8 +177,6 @@ defmodule TitanFlowWeb.TemplateLive.Index do
     {:noreply, assign(socket, clone_name: name)}
   end
 
-
-
   @impl true
   def handle_event("update_clone_body", %{"body" => body}, socket) do
     {:noreply, assign(socket, clone_body_text: body)}
@@ -212,9 +186,9 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   def handle_event("update_button_text", %{"index" => index_str, "value" => text}, socket) do
     index = String.to_integer(index_str)
     buttons = socket.assigns.clone_buttons
-    
+
     updated_buttons = List.update_at(buttons, index, fn btn -> Map.put(btn, "text", text) end)
-    
+
     {:noreply, assign(socket, clone_buttons: updated_buttons)}
   end
 
@@ -222,9 +196,9 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   def handle_event("update_button_url", %{"index" => index_str, "value" => url}, socket) do
     index = String.to_integer(index_str)
     buttons = socket.assigns.clone_buttons
-    
+
     updated_buttons = List.update_at(buttons, index, fn btn -> Map.put(btn, "url", url) end)
-    
+
     {:noreply, assign(socket, clone_buttons: updated_buttons)}
   end
 
@@ -242,38 +216,42 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   @impl true
   def handle_event("set_header_type", %{"type" => type}, socket) do
     # Clear uploaded file and update allowed file types when changing header type
-    accept = case type do
-      "image" -> ~w(.jpg .jpeg .png)
-      "video" -> ~w(.mp4 .3gp)
-      "document" -> ~w(.pdf)
-      _ -> ~w(.jpg .jpeg .png .mp4 .3gp .pdf)
-    end
-    
-    socket = socket
+    accept =
+      case type do
+        "image" -> ~w(.jpg .jpeg .png)
+        "video" -> ~w(.mp4 .3gp)
+        "document" -> ~w(.pdf)
+        _ -> ~w(.jpg .jpeg .png .mp4 .3gp .pdf)
+      end
+
+    socket =
+      socket
       |> assign(header_type: type)
       |> assign(uploaded_file: nil)
       |> assign(media_handle: nil)
       |> assign(media_type: nil)
       |> assign(upload_error: nil)
-      |> allow_upload(:header_media, 
-           accept: accept, 
-           max_entries: 1, 
-           max_file_size: 16_000_000,
-           auto_upload: true,
-           progress: &handle_progress/3)
-    
+      |> allow_upload(:header_media,
+        accept: accept,
+        max_entries: 1,
+        max_file_size: 16_000_000,
+        auto_upload: true,
+        progress: &handle_progress/3
+      )
+
     {:noreply, socket}
   end
 
   @impl true
   def handle_event("remove_upload", _params, socket) do
     # Clear the uploaded file
-    socket = socket
+    socket =
+      socket
       |> assign(uploaded_file: nil)
       |> assign(media_handle: nil)
       |> assign(media_type: nil)
       |> assign(upload_error: nil)
-    
+
     {:noreply, socket}
   end
 
@@ -285,22 +263,28 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   # Unified filter handler for the filter form
   @impl true
   def handle_event("filter", params, socket) do
-    socket = socket
+    socket =
+      socket
       |> assign(filter_search: params["search"] || socket.assigns.filter_search)
       |> assign(filter_phone: params["phone"] || socket.assigns.filter_phone)
       |> assign(filter_category: params["category"] || socket.assigns.filter_category)
       |> assign(filter_status: params["status"] || socket.assigns.filter_status)
-      |> assign(page: 1)  # Reset to page 1 on filter change
+      # Reset to page 1 on filter change
+      |> assign(page: 1)
       |> load_templates()
+
     {:noreply, socket}
   end
 
   @impl true
   def handle_event("change_page", %{"page" => page_str}, socket) do
     page = String.to_integer(page_str)
-    socket = socket
+
+    socket =
+      socket
       |> assign(page: page)
       |> load_templates()
+
     {:noreply, socket}
   end
 
@@ -318,100 +302,58 @@ defmodule TitanFlowWeb.TemplateLive.Index do
     {:noreply, assign(socket, target_phone_id: String.to_integer(phone_id))}
   end
 
-  # Handle upload progress - auto-upload to Meta when file upload completes
-  defp handle_progress(:header_media, entry, socket) do
-    if entry.done? do
-      # File has been uploaded to server, now upload to Meta
-      socket = assign(socket, uploading: true, upload_error: nil)
-      
-      consume_uploaded_entry(socket, entry, fn %{path: path} ->
-        phone_numbers = WhatsApp.list_phone_numbers()
-        
-        case phone_numbers do
-          [phone | _] ->
-            # Check if app_id is configured
-            if is_nil(phone.app_id) or phone.app_id == "" do
-              send(self(), {:upload_error, "Facebook App ID not configured. Please add it in Phone Numbers settings."})
-              {:error, :missing_app_id}
-            else
-              file_size = File.stat!(path).size
-              mime_type = get_mime_type(entry.client_name)
-              media_type = get_media_type(mime_type)
-              
-              case MediaUploader.upload_for_template(
-                path,
-                file_size,
-                mime_type,
-                phone.app_id,
-                phone.access_token
-              ) do
-                {:ok, handle} ->
-                  send(self(), {:upload_complete, handle, entry.client_name, media_type})
-                  {:ok, handle}
-                {:error, reason} ->
-                  send(self(), {:upload_error, reason})
-                  {:error, reason}
-              end
-            end
-          [] ->
-            send(self(), {:upload_error, :no_phone_numbers})
-            {:error, :no_phone_numbers}
-        end
-      end)
-      
-      {:noreply, socket}
-    else
-      {:noreply, socket}
-    end
-  end
-
   @impl true
   def handle_event("upload_header", _params, socket) do
     socket = assign(socket, uploading: true, upload_error: nil)
-    
+
     # Process the upload
     case socket.assigns.uploads.header_media.entries do
       [entry | _] ->
         # Consume the upload and get the file path
-        result = consume_uploaded_entry(socket, entry, fn %{path: path} ->
-          # Get phone number for upload credentials
-          phone_numbers = WhatsApp.list_phone_numbers()
-          
-          case phone_numbers do
-            [phone | _] ->
-              if is_nil(phone.app_id) or phone.app_id == "" do
-                {:error, "Facebook App ID not configured"}
-              else
-                file_size = File.stat!(path).size
-                mime_type = get_mime_type(entry.client_name)
-                
-                # Upload to Meta
-                MediaUploader.upload_for_template(
-                  path,
-                  file_size,
-                  mime_type,
-                  phone.app_id,
-                  phone.access_token
-                )
-              end
-            [] ->
-              {:error, :no_phone_numbers}
+        result =
+          consume_uploaded_entry(socket, entry, fn %{path: path} ->
+            # Get phone number for upload credentials
+            phone_numbers = WhatsApp.list_phone_numbers()
+
+            case phone_numbers do
+              [phone | _] ->
+                if is_nil(phone.app_id) or phone.app_id == "" do
+                  {:error, "Facebook App ID not configured"}
+                else
+                  file_size = File.stat!(path).size
+                  mime_type = get_mime_type(entry.client_name)
+
+                  # Upload to Meta
+                  MediaUploader.upload_for_template(
+                    path,
+                    file_size,
+                    mime_type,
+                    phone.app_id,
+                    phone.access_token
+                  )
+                end
+
+              [] ->
+                {:error, :no_phone_numbers}
+            end
+          end)
+
+        socket =
+          case result do
+            {:ok, handle} ->
+              socket
+              |> assign(media_handle: handle)
+              |> assign(uploaded_file: entry.client_name)
+              |> assign(uploading: false)
+
+            {:error, reason} ->
+              socket
+              |> assign(upload_error: "Upload failed: #{inspect(reason)}")
+              |> assign(uploading: false)
           end
-        end)
-        
-        socket = case result do
-          {:ok, handle} ->
-            socket
-            |> assign(media_handle: handle)
-            |> assign(uploaded_file: entry.client_name)
-            |> assign(uploading: false)
-          {:error, reason} ->
-            socket
-            |> assign(upload_error: "Upload failed: #{inspect(reason)}")
-            |> assign(uploading: false)
-        end
-        
+
         {:noreply, socket}
+
       [] ->
         {:noreply, assign(socket, uploading: false, upload_error: "No file selected")}
     end
@@ -420,46 +362,141 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   def handle_event("create_clone", _params, socket) do
     template = socket.assigns.cloning_template
     target_phone_id = socket.assigns.target_phone_id
-    
+
     # Find the selected phone number
     target_phone = Enum.find(socket.assigns.phone_numbers, fn p -> p.id == target_phone_id end)
-    
+
     case target_phone do
       %{} = phone ->
         # Build components with updated body text and optional header
-        components = build_clone_components(
-          template.components,
-          socket.assigns.clone_body_text,
-          socket.assigns.media_handle,
-          socket.assigns.media_type,
-          socket.assigns.clone_buttons,
-          socket.assigns.variable_values
-        )
-        
-        # Determine category - default to MARKETING if nil
-        category = template.category || "MARKETING"
-        
+        components =
+          build_clone_components(
+            template.components,
+            socket.assigns.clone_body_text,
+            socket.assigns.media_handle,
+            socket.assigns.media_type,
+            socket.assigns.clone_buttons,
+            socket.assigns.variable_values
+          )
+
         case Templates.create_clone(
-          template,
-          socket.assigns.clone_name,
-          components,
-          socket.assigns.clone_language,
-          phone.waba_id,
-          phone.access_token
-        ) do
+               template,
+               socket.assigns.clone_name,
+               components,
+               socket.assigns.clone_language,
+               phone.waba_id,
+               phone.access_token
+             ) do
           {:ok, _} ->
-            {:noreply, socket
-              |> put_flash(:info, "Template clone created successfully! Pending approval.")
-              |> assign(show_clone_modal: false)
-              |> load_templates()}
+            {:noreply,
+             socket
+             |> put_flash(:info, "Template clone created successfully! Pending approval.")
+             |> assign(show_clone_modal: false)
+             |> load_templates()}
+
           {:error, {:api_error, _, body}} ->
             error_msg = get_in(body, ["error", "message"]) || "API error"
             {:noreply, put_flash(socket, :error, "Clone failed: #{error_msg}")}
+
           {:error, reason} ->
             {:noreply, put_flash(socket, :error, "Clone failed: #{inspect(reason)}")}
         end
+
       nil ->
         {:noreply, put_flash(socket, :error, "Please select a phone number")}
+    end
+  end
+
+  @impl true
+  def handle_info({:sync_complete, result}, socket) do
+    socket = assign(socket, syncing: false)
+
+    socket =
+      case result do
+        {:ok, count} ->
+          socket
+          |> put_flash(:info, "Synced #{count} templates from Meta!")
+          |> load_templates()
+
+        {:error, :no_phone_numbers} ->
+          put_flash(socket, :error, "No phone numbers configured. Add a phone number first.")
+
+        {:error, reason} ->
+          put_flash(socket, :error, "Sync failed: #{inspect(reason)}")
+      end
+
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_info({:upload_complete, handle, filename, media_type}, socket) do
+    {:noreply,
+     socket
+     |> assign(media_handle: handle)
+     |> assign(uploaded_file: filename)
+     |> assign(media_type: media_type)
+     |> assign(uploading: false)}
+  end
+
+  @impl true
+  def handle_info({:upload_error, reason}, socket) do
+    {:noreply,
+     socket
+     |> assign(upload_error: "Upload failed: #{inspect(reason)}")
+     |> assign(uploading: false)}
+  end
+
+  # Handle upload progress - auto-upload to Meta when file upload completes
+  defp handle_progress(:header_media, entry, socket) do
+    if entry.done? do
+      # File has been uploaded to server, now upload to Meta
+      socket = assign(socket, uploading: true, upload_error: nil)
+
+      consume_uploaded_entry(socket, entry, fn %{path: path} ->
+        phone_numbers = WhatsApp.list_phone_numbers()
+
+        case phone_numbers do
+          [phone | _] ->
+            # Check if app_id is configured
+            if is_nil(phone.app_id) or phone.app_id == "" do
+              send(
+                self(),
+                {:upload_error,
+                 "Facebook App ID not configured. Please add it in Phone Numbers settings."}
+              )
+
+              {:error, :missing_app_id}
+            else
+              file_size = File.stat!(path).size
+              mime_type = get_mime_type(entry.client_name)
+              media_type = get_media_type(mime_type)
+
+              case MediaUploader.upload_for_template(
+                     path,
+                     file_size,
+                     mime_type,
+                     phone.app_id,
+                     phone.access_token
+                   ) do
+                {:ok, handle} ->
+                  send(self(), {:upload_complete, handle, entry.client_name, media_type})
+                  {:ok, handle}
+
+                {:error, reason} ->
+                  send(self(), {:upload_error, reason})
+                  {:error, reason}
+              end
+            end
+
+          [] ->
+            send(self(), {:upload_error, :no_phone_numbers})
+            {:error, :no_phone_numbers}
+        end
+      end)
+
+      {:noreply, socket}
+    else
+      {:noreply, socket}
     end
   end
 
@@ -470,10 +507,10 @@ defmodule TitanFlowWeb.TemplateLive.Index do
       search: Map.get(socket.assigns, :filter_search, ""),
       phone: Map.get(socket.assigns, :filter_phone, "all")
     }
-    
+
     page = Map.get(socket.assigns, :page, 1)
     result = Templates.list_templates(page, 25, filters)
-    
+
     socket
     |> assign(templates: result.entries)
     |> assign(page: result.page)
@@ -482,59 +519,71 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   end
 
   defp extract_body_text(nil), do: ""
+
   defp extract_body_text(components) when is_list(components) do
     body = Enum.find(components, fn c -> c["type"] == "BODY" end)
     body["text"] || ""
   end
+
   defp extract_body_text(_), do: ""
 
-  defp build_clone_components(original_components, body_text, media_handle, media_type, buttons, variable_values) do
+  defp build_clone_components(
+         original_components,
+         body_text,
+         media_handle,
+         media_type,
+         buttons,
+         variable_values
+       ) do
     components = original_components || []
-    
+
     # Update BODY and BUTTONS
-    components = Enum.map(components, fn comp ->
-      cond do
-        comp["type"] == "BODY" ->
-          updated_comp = Map.put(comp, "text", body_text)
-          
-          # Add example variable values if provided
-          if map_size(variable_values) > 0 do
-            # Convert map values to list of strings in order
-            examples = 
-              Regex.scan(~r/{{(\d+)}}/, body_text)
-              |> Enum.map(fn [_, var] -> Map.get(variable_values, var, "example_#{var}") end)
-            
-            if Enum.empty?(examples) do
-              updated_comp
+    components =
+      Enum.map(components, fn comp ->
+        cond do
+          comp["type"] == "BODY" ->
+            updated_comp = Map.put(comp, "text", body_text)
+
+            # Add example variable values if provided
+            if map_size(variable_values) > 0 do
+              # Convert map values to list of strings in order
+              examples =
+                Regex.scan(~r/{{(\d+)}}/, body_text)
+                |> Enum.map(fn [_, var] -> Map.get(variable_values, var, "example_#{var}") end)
+
+              if Enum.empty?(examples) do
+                updated_comp
+              else
+                Map.put(updated_comp, "example", %{"body_text" => [examples]})
+              end
             else
-               Map.put(updated_comp, "example", %{"body_text" => [examples]})
+              updated_comp
             end
-          else
-            updated_comp
-          end
-        
-        comp["type"] == "BUTTONS" && buttons ->
-          Map.put(comp, "buttons", buttons)
-          
-        true ->
-          comp
-      end
-    end)
-    
+
+          comp["type"] == "BUTTONS" && buttons ->
+            Map.put(comp, "buttons", buttons)
+
+          true ->
+            comp
+        end
+      end)
+
     # Add HEADER with media if handle provided
     if media_handle do
       # Determine format based on media type
-      format = case media_type do
-        "video" -> "VIDEO"
-        "image" -> "IMAGE"
-        _ -> "DOCUMENT"
-      end
-      
+      format =
+        case media_type do
+          "video" -> "VIDEO"
+          "image" -> "IMAGE"
+          _ -> "DOCUMENT"
+        end
+
       header = %{
         "type" => "HEADER",
         "format" => format,
         "example" => %{"header_handle" => [media_handle]}
       }
+
       [header | Enum.reject(components, fn c -> c["type"] == "HEADER" end)]
     else
       components
@@ -572,6 +621,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   end
 
   defp extract_buttons(nil), do: nil
+
   defp extract_buttons(components) do
     case Enum.find(components, fn c -> c["type"] == "BUTTONS" end) do
       %{"buttons" => buttons} -> buttons
@@ -587,6 +637,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
   end
 
   defp detect_header_type(nil), do: "none"
+
   defp detect_header_type(components) do
     case Enum.find(components, fn c -> c["type"] == "HEADER" end) do
       %{"format" => "TEXT"} -> "text"
@@ -618,6 +669,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
       end
     end)
   end
+
   defp preview_body_text(_, _), do: ""
 
   # Client-side filtering removed - now handled server-side in Templates context
@@ -1163,7 +1215,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
                       <p class="text-sm text-base-content whitespace-pre-wrap"><%= preview_body_text(@clone_body_text, @variable_values) %></p>
                       
                       <!-- Timestamp -->
-                      <p class="text-xs text-base-content/40 text-right mt-2"><%= Calendar.strftime(DateTime.utc_now(), "%H:%M") %> ✓✓</p>
+                      <p class="text-xs text-base-content/40 text-right mt-2"><%= DateTimeHelpers.format_time(DateTime.utc_now()) %> ✓✓</p>
                     </div>
                     
                     <!-- Buttons Preview -->
@@ -1276,7 +1328,7 @@ defmodule TitanFlowWeb.TemplateLive.Index do
                     <% end %>
                     
                     <!-- Timestamp -->
-                    <p class="text-xs text-base-content/40 text-right mt-2"><%= Calendar.strftime(DateTime.utc_now(), "%H:%M") %> ✓✓</p>
+                    <p class="text-xs text-base-content/40 text-right mt-2"><%= DateTimeHelpers.format_time(DateTime.utc_now()) %> ✓✓</p>
                   </div>
                   
                   <!-- Buttons Preview -->
@@ -1373,7 +1425,5 @@ defmodule TitanFlowWeb.TemplateLive.Index do
       </div>
     <% end %>
     """
-
-
   end
 end

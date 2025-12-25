@@ -6,12 +6,13 @@ defmodule TitanFlowWeb.SettingsLive do
   @impl true
   def mount(_params, _session, socket) do
     api_key = Settings.get_value("openai_api_key", "")
-    
-    {:ok, assign(socket, 
-      api_key: api_key,
-      current_path: "/settings",
-      saved: false
-    )}
+
+    {:ok,
+     assign(socket,
+       api_key: api_key,
+       current_path: "/settings",
+       saved: false
+     )}
   end
 
   @impl true
@@ -63,10 +64,11 @@ defmodule TitanFlowWeb.SettingsLive do
   @impl true
   def handle_event("save", %{"openai_api_key" => key}, socket) do
     Settings.set_value("openai_api_key", key)
-    
-    {:noreply, assign(socket, 
-      api_key: key, 
-      saved: true
-    )}
+
+    {:noreply,
+     assign(socket,
+       api_key: key,
+       saved: true
+     )}
   end
 end

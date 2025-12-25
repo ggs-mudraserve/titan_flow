@@ -1,11 +1,11 @@
 defmodule TitanFlow.Campaigns.Metrics do
   @moduledoc """
   Campaign system telemetry and metrics.
-  
+
   ## Emitted Events (5A)
-  
+
   All events are prefixed with `[:titan_flow, :campaign, ...]`
-  
+
   - `[:titan_flow, :campaign, :pipeline, :message_processed]`
     Measurements: %{duration: native_time}
     Metadata: %{campaign_id, phone_number_id, status}
@@ -21,16 +21,16 @@ defmodule TitanFlow.Campaigns.Metrics do
   - `[:titan_flow, :campaign, :queue, :depth]`
     Measurements: %{depth: integer}
     Metadata: %{campaign_id, phone_number_id}
-  
+
   ## Connection Pool Metrics (6A)
-  
+
   Ecto already emits queue_time and checkout metrics. We add visibility via:
   - Periodic pool status logging
   - Alert when pool is saturated (checkout > 5s)
   """
-  
+
   require Logger
-  
+
   @doc """
   Emit a metric for message processing in Pipeline.
   """
@@ -38,16 +38,16 @@ defmodule TitanFlow.Campaigns.Metrics do
     start = System.monotonic_time()
     result = fun.()
     duration = System.monotonic_time() - start
-    
+
     :telemetry.execute(
       [:titan_flow, :campaign, :pipeline, :message_processed],
       %{duration: duration},
       %{campaign_id: campaign_id, phone_number_id: phone_number_id, status: status}
     )
-    
+
     result
   end
-  
+
   @doc """
   Emit a metric for BufferManager refill operation.
   """
@@ -55,16 +55,16 @@ defmodule TitanFlow.Campaigns.Metrics do
     start = System.monotonic_time()
     {count, result} = fun.()
     duration = System.monotonic_time() - start
-    
+
     :telemetry.execute(
       [:titan_flow, :campaign, :buffer, :refill],
       %{duration: duration, count: count},
       %{campaign_id: campaign_id, phone_number_id: phone_number_id}
     )
-    
+
     result
   end
-  
+
   @doc """
   Emit a metric for LogBatcher flush operation.
   """
@@ -72,16 +72,16 @@ defmodule TitanFlow.Campaigns.Metrics do
     start = System.monotonic_time()
     count = fun.()
     duration = System.monotonic_time() - start
-    
+
     :telemetry.execute(
       [:titan_flow, :campaign, :log_batcher, :flush],
       %{duration: duration, count: count},
       %{buffer_type: buffer_type}
     )
-    
+
     count
   end
-  
+
   @doc """
   Report current queue depth (called periodically).
   """
@@ -92,13 +92,15 @@ defmodule TitanFlow.Campaigns.Metrics do
       %{campaign_id: campaign_id, phone_number_id: phone_number_id}
     )
   end
-  
+
   @doc """
   Emit an alert for pool saturation (6A).
   """
   def alert_pool_saturation(checkout_time_ms) do
-    Logger.error("[ALERT] DB Pool Saturation: checkout time #{checkout_time_ms}ms exceeds 5s threshold")
-    
+    Logger.error(
+      "[ALERT] DB Pool Saturation: checkout time #{checkout_time_ms}ms exceeds 5s threshold"
+    )
+
     :telemetry.execute(
       [:titan_flow, :campaign, :pool, :saturation],
       %{checkout_time_ms: checkout_time_ms},

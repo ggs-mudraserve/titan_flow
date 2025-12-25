@@ -14,12 +14,12 @@ defmodule TitanFlow.Templates do
 
   @doc """
   List templates with optional pagination and filters.
-  
+
   ## Options
   - `page` - Page number (default: 1)
   - `per_page` - Items per page (default: :all for backward compatibility)
   - `filters` - Map with optional keys: :category, :status, :search, :phone
-  
+
   ## Returns
   When paginated: %{entries: [...], page: int, total_pages: int, total: int}
   When not paginated (per_page: :all): list of templates
@@ -36,19 +36,21 @@ defmodule TitanFlow.Templates do
 
   # Paginated version
   def list_templates(page, per_page, filters) when is_integer(per_page) do
-    query = base_query()
+    query =
+      base_query()
       |> apply_filters(filters)
       |> order_by(desc: :inserted_at)
-    
+
     total = Repo.aggregate(query, :count)
     total_pages = max(1, ceil(total / per_page))
     offset = (page - 1) * per_page
-    
-    entries = query
+
+    entries =
+      query
       |> limit(^per_page)
       |> offset(^offset)
       |> Repo.all()
-    
+
     %{
       entries: entries,
       page: page,
@@ -71,6 +73,7 @@ defmodule TitanFlow.Templates do
 
   defp filter_by_category(query, nil), do: query
   defp filter_by_category(query, "all"), do: query
+
   defp filter_by_category(query, category) do
     cat_upper = String.upcase(category)
     where(query, [t], fragment("UPPER(?)", t.category) == ^cat_upper)
@@ -78,6 +81,7 @@ defmodule TitanFlow.Templates do
 
   defp filter_by_status(query, nil), do: query
   defp filter_by_status(query, "all"), do: query
+
   defp filter_by_status(query, status) do
     status_upper = String.upcase(status)
     where(query, [t], fragment("UPPER(?)", t.status) == ^status_upper)
@@ -85,6 +89,7 @@ defmodule TitanFlow.Templates do
 
   defp filter_by_search(query, nil), do: query
   defp filter_by_search(query, ""), do: query
+
   defp filter_by_search(query, search) do
     pattern = "%#{String.downcase(search)}%"
     where(query, [t], ilike(t.name, ^pattern))
@@ -92,6 +97,7 @@ defmodule TitanFlow.Templates do
 
   defp filter_by_phone(query, nil), do: query
   defp filter_by_phone(query, "all"), do: query
+
   defp filter_by_phone(query, phone_name) do
     where(query, [t], t.phone_display_name == ^phone_name)
   end
@@ -107,6 +113,10 @@ defmodule TitanFlow.Templates do
 
   def get_by_meta_id(meta_template_id) do
     Repo.get_by(Template, meta_template_id: meta_template_id)
+  end
+
+  def get_template_by_name(template_name) do
+    Repo.get_by(Template, name: template_name)
   end
 
   def create_template(attrs \\ %{}) do
@@ -135,73 +145,92 @@ defmodule TitanFlow.Templates do
   """
   def sync_from_meta do
     phone_numbers = WhatsApp.list_phone_numbers()
-    
+
     if Enum.empty?(phone_numbers) do
       {:error, :no_phone_numbers}
     else
-      total = 
+      total =
         phone_numbers
         |> Enum.map(&sync_templates_for_waba/1)
         |> Enum.sum()
-      
+
       {:ok, total}
     end
   end
 
-  defp sync_templates_for_waba(phone_number) do
-
+  def sync_templates_for_waba(phone_number) do
     url = "https://graph.facebook.com/v21.0/#{phone_number.waba_id}/message_templates"
-    
-    case Req.get(url, 
-      headers: [{"Authorization", "Bearer #{phone_number.access_token}"}],
-      params: [limit: 250]
-    ) do
+
+    case Req.get(url,
+           headers: [{"Authorization", "Bearer #{phone_number.access_token}"}],
+           params: [limit: 250]
+         ) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         # Decode body if it's a string (Req sometimes doesn't auto-decode)
-        data = case body do
-          b when is_binary(b) -> Jason.decode!(b)
-          map when is_map(map) -> map
-          _ -> %{}
-        end
+        data =
+          case body do
+            b when is_binary(b) -> Jason.decode!(b)
+            map when is_map(map) -> map
+            _ -> %{}
+          end
 
         case data do
           %{"data" => templates} ->
             Enum.each(templates, fn t -> upsert_template(t, phone_number) end)
             length(templates)
+
           _ ->
-             Logger.error("Template sync unexpected body structure for WABA #{phone_number.waba_id}: #{inspect(data)}")
-             0
+            Logger.error(
+              "Template sync unexpected body structure for WABA #{phone_number.waba_id}: #{inspect(data)}"
+            )
+
+            0
         end
 
       {:ok, %Req.Response{status: status, body: body}} ->
-        Logger.error("Template sync failed for WABA #{phone_number.waba_id}: HTTP #{status} - #{inspect(body)}")
+        Logger.error(
+          "Template sync failed for WABA #{phone_number.waba_id}: HTTP #{status} - #{inspect(body)}"
+        )
+
         0
 
       {:error, reason} ->
-        Logger.error("Template sync request failed for WABA #{phone_number.waba_id}: #{inspect(reason)}")
+        Logger.error(
+          "Template sync request failed for WABA #{phone_number.waba_id}: #{inspect(reason)}"
+        )
+
         0
     end
   end
 
   defp upsert_template(meta_template, phone_number) do
     status = meta_template["status"]
-    
+
     # Auto-delete DISABLED templates (if not referenced by campaigns)
     if status == "DISABLED" do
       case get_by_meta_id(meta_template["id"]) do
-        nil -> :ok  # Not in DB, nothing to delete
-        existing -> 
+        # Not in DB, nothing to delete
+        nil ->
+          :ok
+
+        existing ->
           try do
             case Repo.delete(existing) do
-              {:ok, _} -> 
+              {:ok, _} ->
                 Logger.info("Auto-deleted DISABLED template: #{meta_template["name"]}")
-              {:error, changeset} -> 
-                Logger.warning("Could not delete DISABLED template #{meta_template["name"]}: #{inspect(changeset.errors)}")
+
+              {:error, changeset} ->
+                Logger.warning(
+                  "Could not delete DISABLED template #{meta_template["name"]}: #{inspect(changeset.errors)}"
+                )
             end
           rescue
             Ecto.ConstraintError ->
               # Template is still referenced by a campaign, just update status instead
-              Logger.warning("Template #{meta_template["name"]} is referenced by campaigns, updating status only")
+              Logger.warning(
+                "Template #{meta_template["name"]} is referenced by campaigns, updating status only"
+              )
+
               update_template(existing, %{status: "DISABLED"})
           end
       end
@@ -218,17 +247,26 @@ defmodule TitanFlow.Templates do
       }
 
       case get_by_meta_id(meta_template["id"]) do
-        nil -> 
+        nil ->
           case create_template(attrs) do
-            {:ok, _} -> :ok
-            {:error, changeset} -> 
-              Logger.error("Failed to create template #{meta_template["name"]}: #{inspect(changeset.errors)}")
-          end
-        existing -> 
-          case update_template(existing, attrs) do
-            {:ok, _} -> :ok
+            {:ok, _} ->
+              :ok
+
             {:error, changeset} ->
-              Logger.error("Failed to update template #{meta_template["name"]}: #{inspect(changeset.errors)}")
+              Logger.error(
+                "Failed to create template #{meta_template["name"]}: #{inspect(changeset.errors)}"
+              )
+          end
+
+        existing ->
+          case update_template(existing, attrs) do
+            {:ok, _} ->
+              :ok
+
+            {:error, changeset} ->
+              Logger.error(
+                "Failed to update template #{meta_template["name"]}: #{inspect(changeset.errors)}"
+              )
           end
       end
     end
@@ -248,9 +286,9 @@ defmodule TitanFlow.Templates do
     }
 
     case Req.post(url,
-      json: payload,
-      headers: [{"Authorization", "Bearer #{access_token}"}]
-    ) do
+           json: payload,
+           headers: [{"Authorization", "Bearer #{access_token}"}]
+         ) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         # Save the new template locally
         create_template(%{

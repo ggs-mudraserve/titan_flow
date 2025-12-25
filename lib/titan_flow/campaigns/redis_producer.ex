@@ -20,11 +20,12 @@ defmodule TitanFlow.Campaigns.RedisProducer do
     list_name = Keyword.fetch!(opts, :list_name)
     batch_size = Keyword.get(opts, :batch_size, 100)
 
-    {:ok, conn} = Redix.start_link(
-      host: redis_config[:host],
-      port: redis_config[:port],
-      password: redis_config[:password]
-    )
+    {:ok, conn} =
+      Redix.start_link(
+        host: redis_config[:host],
+        port: redis_config[:port],
+        password: redis_config[:password]
+      )
 
     state = %{
       conn: conn,
@@ -67,23 +68,23 @@ defmodule TitanFlow.Campaigns.RedisProducer do
       {:ok, items} when is_list(items) ->
         messages = Enum.map(items, &wrap_message/1)
         new_demand = state.demand - length(messages)
-        
+
         # If we got items and still have demand, continue immediately
         if new_demand > 0 do
           send(self(), :poll)
         end
-        
+
         {messages, %{state | demand: new_demand}}
 
       {:ok, item} when is_binary(item) ->
         # Single item returned (older Redis)
         messages = [wrap_message(item)]
         new_demand = state.demand - 1
-        
+
         if new_demand > 0 do
           send(self(), :poll)
         end
-        
+
         {messages, %{state | demand: new_demand}}
 
       {:error, reason} ->

@@ -3,7 +3,7 @@ defmodule TitanFlow.WhatsApp.Client do
   WhatsApp Cloud API client for sending messages.
 
   Provides functions for sending template messages via the Meta Graph API.
-  Returns HTTP headers alongside response body for rate limit tracking.
+  Returns HTTP headers alongside response body for troubleshooting.
   """
 
   @graph_api_base "https://graph.facebook.com/v21.0"
@@ -28,7 +28,7 @@ defmodule TitanFlow.WhatsApp.Client do
       ...>   %{"type" => "body", "parameters" => [%{"type" => "text", "text" => "John"}]}
       ...> ]
       iex> Client.send_template("14155551234", "hello_world", "en_US", components, credentials)
-      {:ok, %{"messages" => [%{"id" => "wamid.xxx"}]}, [{"x-rate-limit-remaining", "999"}]}
+      {:ok, %{"messages" => [%{"id" => "wamid.xxx"}]}, [{"content-type", "application/json"}]}
   """
   @spec send_template(String.t(), String.t(), String.t(), list(), map()) ::
           {:ok, map(), list()} | {:error, term()}
@@ -60,7 +60,8 @@ defmodule TitanFlow.WhatsApp.Client do
            ],
            receive_timeout: 30_000
          ) do
-      {:ok, %Req.Response{status: status, body: body, headers: headers}} when status in 200..299 ->
+      {:ok, %Req.Response{status: status, body: body, headers: headers}}
+      when status in 200..299 ->
         {:ok, body, headers}
 
       {:ok, %Req.Response{status: status, body: body, headers: headers}} ->
@@ -71,40 +72,8 @@ defmodule TitanFlow.WhatsApp.Client do
     end
   end
 
-  @doc """
-  Extract rate limit information from response headers.
-
-  ## Parameters
-  - `headers` - List of header tuples from API response
-
-  ## Returns
-  - Map with rate limit info: `%{remaining: integer, limit: integer, reset: integer}`
-  """
-  @spec parse_rate_limit_headers(list()) :: map()
-  def parse_rate_limit_headers(headers) do
-    headers_map =
-      headers
-      |> Enum.reduce(%{}, fn {key, value}, acc ->
-        # Handle both single values and lists
-        val = if is_list(value), do: List.first(value), else: value
-        Map.put(acc, String.downcase(key), val)
-      end)
-
-    %{
-      remaining: parse_int(Map.get(headers_map, "x-rate-limit-remaining")),
-      limit: parse_int(Map.get(headers_map, "x-rate-limit-limit")),
-      reset: parse_int(Map.get(headers_map, "x-rate-limit-reset"))
-    }
-  end
-
-  defp parse_int(nil), do: nil
-  defp parse_int(value) when is_binary(value) do
-    case Integer.parse(value) do
-      {int, _} -> int
-      :error -> nil
-    end
-  end
-  defp parse_int(value) when is_integer(value), do: value
+  # Removed: parse_rate_limit_headers/1 - Meta doesn't send x-rate-limit-* headers
+  # Rate limiting now uses campaign-configured MPS
 
   @doc """
   Send a text message via WhatsApp Cloud API.

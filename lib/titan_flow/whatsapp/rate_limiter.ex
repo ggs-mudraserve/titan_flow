@@ -1,32 +1,25 @@
 defmodule TitanFlow.WhatsApp.RateLimiter do
   @moduledoc """
-  Adaptive rate limiter GenServer for WhatsApp message sending.
+  Per-phone rate limiter GenServer for WhatsApp message sending.
 
-  Manages per-phone-number rate limiting with dynamic MPS adjustment
-  based on API response headers (x-rate-limit-remaining).
+  Uses the configured `max_mps` (Messages Per Second) setting.
+  Handles 429 errors with a 10-second cooldown period.
 
   ## Features
   - One GenServer per phone_number_id
   - Uses Hammer for local rate limiting
-  - Dynamically adjusts MPS based on API feedback
-  - Throttles down when approaching limits, throttles up when headroom available
+  - Respects configured MPS (10-500)
+  - Pauses for 10s on 429 errors, then resumes at half-speed
   """
 
   use GenServer
+  require Logger
 
-  alias TitanFlow.WhatsApp.Client
-
-  @default_mps 80
   @min_mps 10
   @max_mps 500
-
-  # Thresholds for adjusting rate
-  @throttle_down_threshold 20
-  @throttle_up_threshold 80
-
-  # Adjustment amounts
-  @throttle_down_amount 10
-  @throttle_up_amount 5
+  @default_mps 80
+  @pause_duration_ms 10_000
+  @spam_pause_duration_ms 60_000
 
   # Client API
 
@@ -36,7 +29,7 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
   ## Options
   - `:phone_number_id` - Required. WhatsApp phone number ID
   - `:access_token` - Required. API access token
-  - `:initial_mps` - Optional. Starting messages per second (default: 80)
+  - `:max_mps` - Optional. Messages per second limit (default: 80)
   """
   def start_link(opts) do
     phone_number_id = Keyword.fetch!(opts, :phone_number_id)
@@ -45,29 +38,25 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
   end
 
   @doc """
-  Dispatch a template message through the rate limiter.
-
-  ## Parameters
-  - `phone_number_id` - The phone number ID (identifies the GenServer)
-  - `message` - Map with `:to_phone`, `:template_name`, `:language_code`, `:components`
+  Check rate limit for sending a message.
 
   ## Returns
-  - `{:ok, :allowed}` - Rate limit check passed, caller can proceed with HTTP call
-  - `{:error, :rate_limited}` - Rate limit exceeded, caller should retry later
+  - `{:ok, :allowed, access_token}` - Rate limit check passed
+  - `{:error, :rate_limited}` - Rate limit exceeded
   """
   def dispatch(phone_number_id, _message) do
-    # Check if RateLimiter is running, start on-demand if not
     case Registry.lookup(TitanFlow.WhatsApp.RateLimiterRegistry, phone_number_id) do
       [] ->
-        # Not running - try to start it
         case start_on_demand(phone_number_id) do
           {:ok, _pid} ->
-            GenServer.call(via_tuple(phone_number_id), :check_rate, 5_000)
+            safe_check_rate(phone_number_id)
+
           {:error, reason} ->
             {:error, {:rate_limiter_start_failed, reason}}
         end
+
       _ ->
-        GenServer.call(via_tuple(phone_number_id), :check_rate, 5_000)
+        safe_check_rate(phone_number_id)
     end
   end
 
@@ -79,31 +68,17 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
   end
 
   @doc """
-  Update stats from response headers (called by Pipeline after HTTP call).
-  Used for throttle up/down logic.
-  """
-  def update_stats(phone_number_id, headers) do
-    GenServer.cast(via_tuple(phone_number_id), {:update_stats, headers})
-  end
-
-  @doc """
-  Notify RateLimiter of a 429 error (called by Pipeline).
+  Notify RateLimiter of a 429 error. Pauses for 10 seconds.
   """
   def notify_rate_limited(phone_number_id) do
     GenServer.cast(via_tuple(phone_number_id), :rate_limited_429)
   end
 
-  defp start_on_demand(phone_number_id) do
-    # Lookup phone number to get access token
-    case TitanFlow.WhatsApp.get_by_phone_number_id(phone_number_id) do
-      nil ->
-        {:error, :phone_not_found}
-      phone ->
-        DynamicSupervisor.start_child(
-          TitanFlow.PhoneSupervisor,
-          {__MODULE__, phone_number_id: phone_number_id, access_token: phone.access_token}
-        )
-    end
+  @doc """
+  Notify RateLimiter of a 131048 error. Pauses for 60 seconds.
+  """
+  def notify_spam_rate_limited(phone_number_id) do
+    GenServer.cast(via_tuple(phone_number_id), :rate_limited_131048)
   end
 
   @doc """
@@ -120,19 +95,76 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
     GenServer.cast(via_tuple(phone_number_id), {:set_mps, new_mps})
   end
 
+  # Removed: update_stats/2 - no longer used since we removed header parsing
+
+  defp start_on_demand(phone_number_id) do
+    case Process.whereis(TitanFlow.PhoneSupervisor) do
+      nil ->
+        Logger.error(
+          "RateLimiter: PhoneSupervisor not running, cannot start limiter for #{phone_number_id}"
+        )
+
+        {:error, :phone_supervisor_down}
+
+      _pid ->
+        case TitanFlow.WhatsApp.get_by_phone_number_id(phone_number_id) do
+          nil ->
+            {:error, :phone_not_found}
+
+          phone ->
+            try do
+              DynamicSupervisor.start_child(
+                TitanFlow.PhoneSupervisor,
+                {__MODULE__,
+                 phone_number_id: phone_number_id,
+                 access_token: phone.access_token,
+                 max_mps: @default_mps}
+              )
+            catch
+              :exit, reason ->
+                Logger.error(
+                  "RateLimiter: Failed to start limiter for #{phone_number_id}: #{inspect(reason)}"
+                )
+
+                {:error, {:start_failed, reason}}
+            end
+        end
+    end
+  end
+
+  defp safe_check_rate(phone_number_id) do
+    try do
+      GenServer.call(via_tuple(phone_number_id), :check_rate, 5_000)
+    catch
+      :exit, reason ->
+        Logger.error(
+          "RateLimiter: check_rate failed for #{phone_number_id}: #{inspect(reason)}"
+        )
+
+        {:error, {:rate_limiter_down, reason}}
+    end
+  end
+
   # Server Callbacks
 
   @impl true
   def init(opts) do
     phone_number_id = Keyword.fetch!(opts, :phone_number_id)
     access_token = Keyword.fetch!(opts, :access_token)
-    initial_mps = Keyword.get(opts, :initial_mps, @default_mps)
+    max_mps = Keyword.get(opts, :max_mps, @default_mps) |> clamp(@min_mps, @max_mps)
+
+    Logger.info("RateLimiter started for #{phone_number_id} at #{max_mps} MPS")
 
     state = %{
       phone_number_id: phone_number_id,
       access_token: access_token,
-      current_mps: initial_mps,
-      status: :active
+      current_mps: max_mps,
+      # Remember original config for resume
+      configured_mps: max_mps,
+      status: :active,
+      pause_reason: nil,
+      paused_until: nil,
+      resume_mps: nil
     }
 
     {:ok, state}
@@ -146,7 +178,6 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
   def handle_call(:check_rate, _from, state) do
     bucket_key = "send:#{state.phone_number_id}"
 
-    # Check rate limit using Hammer - fast, non-blocking
     case Hammer.check_rate(bucket_key, 1000, state.current_mps) do
       {:allow, _count} ->
         {:reply, {:ok, :allowed, state.access_token}, state}
@@ -167,83 +198,85 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
   end
 
   @impl true
-  def handle_info(:resume_after_pause, state) do
-    # Resume at reduced rate for safety
-    safe_mps = max(div(state.current_mps, 2), @min_mps)
-    {:noreply, %{state | status: :active, current_mps: safe_mps}}
-  end
-
-  @impl true
   def handle_cast({:set_mps, new_mps}, state) do
     clamped_mps = clamp(new_mps, @min_mps, @max_mps)
-    {:noreply, %{state | current_mps: clamped_mps}}
-  end
 
-  @impl true
-  def handle_cast({:update_stats, headers}, state) do
-    # Analyze headers and potentially adjust rate
-    new_state = analyze_and_adjust(headers, state)
-    {:noreply, new_state}
+    Logger.info(
+      "RateLimiter #{state.phone_number_id}: MPS changed #{state.current_mps} -> #{clamped_mps}"
+    )
+
+    {:noreply, %{state | current_mps: clamped_mps, configured_mps: clamped_mps}}
   end
 
   @impl true
   def handle_cast(:rate_limited_429, state) do
-    # 429 Too Many Requests - Cooling off period
-    Process.send_after(self(), :resume_after_pause, 15_000)
-    {:noreply, %{state | status: :paused}}
+    Logger.warning(
+      "RateLimiter #{state.phone_number_id}: 429 received, pausing for #{@pause_duration_ms}ms"
+    )
+
+    safe_mps = max(div(state.configured_mps, 2), @min_mps)
+    {:noreply, pause(state, :rate_limited_429, @pause_duration_ms, safe_mps)}
+  end
+
+  @impl true
+  def handle_cast(:rate_limited_131048, state) do
+    Logger.warning(
+      "RateLimiter #{state.phone_number_id}: 131048 received, pausing for #{@spam_pause_duration_ms}ms"
+    )
+
+    {:noreply, pause(state, :rate_limited_131048, @spam_pause_duration_ms, state.configured_mps)}
+  end
+
+  @impl true
+  def handle_info({:resume_after_pause, reason}, state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    cond do
+      state.status != :paused ->
+        {:noreply, state}
+
+      state.pause_reason != reason ->
+        {:noreply, state}
+
+      state.paused_until && now_ms < state.paused_until ->
+        {:noreply, state}
+
+      true ->
+        resume_mps = state.resume_mps || state.current_mps
+
+        Logger.info(
+          "RateLimiter #{state.phone_number_id}: Resuming at #{resume_mps} MPS (was #{state.configured_mps})"
+        )
+
+        {:noreply,
+         %{
+           state
+           | status: :active,
+             current_mps: resume_mps,
+             pause_reason: nil,
+             paused_until: nil,
+             resume_mps: nil
+         }}
+    end
   end
 
   # Private Functions
 
-  defp send_message(message, state) do
-    %{
-      to_phone: to_phone,
-      template_name: template_name,
-      language_code: language_code,
-      components: components
-    } = message
-
-    credentials = %{
-      access_token: state.access_token,
-      phone_number_id: state.phone_number_id
-    }
-
-    Client.send_template(to_phone, template_name, language_code, components, credentials)
-  end
-
-  defp analyze_and_adjust(headers, state) do
-    rate_info = Client.parse_rate_limit_headers(headers)
-    remaining = rate_info.remaining
-    
-    # DEBUG: Log rate limit info
-    require Logger
-    Logger.info("Rate Limit [Phone #{state.phone_number_id}]: remaining=#{inspect(remaining)}, limit=#{inspect(rate_info.limit)}, current_mps=#{state.current_mps}")
-
-    cond do
-      is_nil(remaining) ->
-        state
-
-      # Brake (Safety): Remaining < 20
-      remaining < 20 ->
-        # Decrease concurrency immediately
-        new_mps = max(state.current_mps - @throttle_down_amount, @min_mps)
-        Logger.warning("Throttling DOWN: #{state.current_mps} -> #{new_mps} (remaining: #{remaining})")
-        %{state | current_mps: new_mps}
-
-      # Accelerator (Speed): Remaining > 80
-      # Note: We should ideally also check if our queue is full, but strictly based on headers:
-      remaining > 80 ->
-        new_mps = min(state.current_mps + @throttle_up_amount, @max_mps)
-        Logger.info("Throttling UP: #{state.current_mps} -> #{new_mps} (remaining: #{remaining})")
-        %{state | current_mps: new_mps}
-
-      true ->
-        state
-    end
-  end
-
   defp via_tuple(phone_number_id) do
     {:via, Registry, {TitanFlow.WhatsApp.RateLimiterRegistry, phone_number_id}}
+  end
+
+  defp pause(state, reason, duration_ms, resume_mps) do
+    paused_until = System.monotonic_time(:millisecond) + duration_ms
+    Process.send_after(self(), {:resume_after_pause, reason}, duration_ms)
+
+    %{
+      state
+      | status: :paused,
+        pause_reason: reason,
+        paused_until: paused_until,
+        resume_mps: resume_mps
+    }
   end
 
   defp clamp(value, min_val, max_val) do

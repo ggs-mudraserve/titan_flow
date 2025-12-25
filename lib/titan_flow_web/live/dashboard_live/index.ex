@@ -3,7 +3,8 @@ defmodule TitanFlowWeb.DashboardLive.Index do
 
   alias TitanFlow.Stats
 
-  @refresh_interval 5_000  # 5 seconds
+  # 30 seconds
+  @refresh_interval 30_000
 
   @impl true
   def mount(_params, _session, socket) do
@@ -45,13 +46,15 @@ defmodule TitanFlowWeb.DashboardLive.Index do
   end
 
   defp build_bar_chart(daily_activity) do
-    max_val = daily_activity
+    max_val =
+      daily_activity
       |> Enum.map(& &1.total)
       |> Enum.max()
       |> max(1)
 
     Enum.map(daily_activity, fn day ->
       height_pct = day.total / max_val * 100
+
       %{
         day_name: day.day_name,
         day_number: day.day_number,

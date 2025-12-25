@@ -2,6 +2,7 @@ defmodule TitanFlowWeb.NumbersLive do
   use TitanFlowWeb, :live_view
 
   alias TitanFlow.WhatsApp
+  alias TitanFlowWeb.DateTimeHelpers
 
   @impl true
   def mount(_params, _session, socket) do
@@ -18,7 +19,7 @@ defmodule TitanFlowWeb.NumbersLive do
   @impl true
   def handle_event("sync_number", %{"id" => id}, socket) do
     number = WhatsApp.get_phone_number!(id)
-    
+
     # In a real app we might want to do this async, but for now we'll do it inline or via Task if needed
     # mocking async for UI feel
     send(self(), {:run_sync, number})
@@ -35,6 +36,7 @@ defmodule TitanFlowWeb.NumbersLive do
         |> assign(syncing_id: nil)
         |> load_numbers()
         |> noreply()
+
       {:error, _} ->
         socket
         |> put_flash(:error, "Failed to sync number")
@@ -105,7 +107,7 @@ defmodule TitanFlowWeb.NumbersLive do
                 <div class="flex items-center justify-between text-sm">
                   <span class="text-zinc-500 font-medium">Last Synced</span>
                   <span class="text-zinc-300 font-mono text-xs">
-                    <%= if number.updated_at, do: Calendar.strftime(number.updated_at, "%b %d, %I:%M %p"), else: "Never" %>
+                    <%= if number.updated_at, do: DateTimeHelpers.format_12_hour(number.updated_at), else: "Never" %>
                   </span>
                 </div>
               </div>

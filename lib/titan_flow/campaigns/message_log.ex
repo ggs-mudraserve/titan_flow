@@ -30,9 +30,18 @@ defmodule TitanFlow.Campaigns.MessageLog do
 
   @required_fields [:meta_message_id]
   @optional_fields [
-    :campaign_id, :contact_id, :phone_number_id, :recipient_phone,
-    :template_name, :status, :error_code, :error_message,
-    :sent_at, :delivered_at, :read_at, :has_replied
+    :campaign_id,
+    :contact_id,
+    :phone_number_id,
+    :recipient_phone,
+    :template_name,
+    :status,
+    :error_code,
+    :error_message,
+    :sent_at,
+    :delivered_at,
+    :read_at,
+    :has_replied
   ]
 
   def changeset(message_log, attrs) do

@@ -3,8 +3,7 @@ defmodule TitanFlowWeb.AuthLive.Login do
 
   @impl true
   def mount(_params, _session, socket) do
-    {:ok, assign(socket, error: nil, current_path: "/login"),
-     layout: {TitanFlowWeb.Layouts, :root}}
+    {:ok, assign(socket, current_path: "/login"), layout: {TitanFlowWeb.Layouts, :root}}
   end
 
   @impl true
@@ -18,7 +17,8 @@ defmodule TitanFlowWeb.AuthLive.Login do
             <p class="text-sm text-base-content/60 mt-2">Enter your PIN to continue</p>
           </div>
 
-          <form phx-submit="unlock" class="space-y-6">
+          <form action={~p"/login"} method="post" class="space-y-6">
+            <input type="hidden" name="_csrf_token" value={Phoenix.Controller.get_csrf_token()} />
             <div>
               <label class="block text-sm font-medium text-base-content mb-2">
                 Enter Admin PIN
@@ -33,9 +33,9 @@ defmodule TitanFlowWeb.AuthLive.Login do
               />
             </div>
 
-            <%= if @error do %>
+            <%= if @flash["error"] do %>
               <div class="bg-error/10 border border-error/20 text-error text-sm rounded-lg px-4 py-3 text-center">
-                <%= @error %>
+                <%= @flash["error"] %>
               </div>
             <% end %>
 
@@ -50,19 +50,5 @@ defmodule TitanFlowWeb.AuthLive.Login do
       </div>
     </div>
     """
-  end
-
-  @impl true
-  def handle_event("unlock", %{"pin" => pin}, socket) do
-    expected_pin = Application.get_env(:titan_flow, :admin_pin, "123456")
-
-    if pin == expected_pin do
-      {:noreply,
-       socket
-       |> put_flash(:info, "Welcome back!")
-       |> redirect(to: ~p"/?authenticated=true")}
-    else
-      {:noreply, assign(socket, error: "Incorrect PIN")}
-    end
   end
 end

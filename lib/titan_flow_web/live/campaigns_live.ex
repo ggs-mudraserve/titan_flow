@@ -2,21 +2,36 @@ defmodule TitanFlowWeb.CampaignsLive do
   use TitanFlowWeb, :live_view
 
   alias TitanFlow.Campaigns
+  alias TitanFlowWeb.DateTimeHelpers
 
-  @per_page 25
+  @per_page 10
+  @queue_check_interval_ms 10_000
+  @webhook_queue_warn_threshold 10_000
 
   @impl true
   def mount(_params, _session, socket) do
     page_data = Campaigns.list_campaigns(1, @per_page)
-    
-    {:ok, assign(socket, 
-      current_path: "/campaigns",
-      campaigns: page_data.entries,
-      page: page_data.page,
-      total_pages: page_data.total_pages,
-      total: page_data.total,
-      selected_campaign: nil
-    )}
+
+    queue_depth = Campaigns.webhook_queue_depth()
+    running_campaigns? = Campaigns.running_campaigns?()
+
+    if connected?(socket) do
+      Process.send_after(self(), :queue_tick, @queue_check_interval_ms)
+    end
+
+    {:ok,
+     assign(socket,
+       current_path: "/campaigns",
+       campaigns: page_data.entries,
+       page: page_data.page,
+       total_pages: page_data.total_pages,
+        total: page_data.total,
+        selected_campaign: nil,
+        retrying_campaigns: MapSet.new(),
+        webhook_queue_depth: queue_depth,
+        running_campaigns?: running_campaigns?,
+        webhook_queue_warn_threshold: @webhook_queue_warn_threshold
+     )}
   end
 
   @impl true
@@ -29,6 +44,13 @@ defmodule TitanFlowWeb.CampaignsLive do
         </.link>
       </:actions>
     </.page_header>
+
+    <%= if @selected_campaign == nil and @webhook_queue_depth >= @webhook_queue_warn_threshold and @running_campaigns? do %>
+      <div class="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-300">
+        Warning: Webhook queue backlog is high at
+        <span class="font-mono font-medium"><%= @webhook_queue_depth %></span>.
+      </div>
+    <% end %>
 
     <%= if @campaigns == [] do %>
       <div class="bg-zinc-900 rounded-lg border border-zinc-800">
@@ -66,8 +88,9 @@ defmodule TitanFlowWeb.CampaignsLive do
                   </div>
                 </td>
                 <td class="px-4 py-2 whitespace-nowrap">
-                  <span class={status_badge_class(campaign.status)}>
-                    <%= campaign.status %>
+                  <% retrying = MapSet.member?(@retrying_campaigns, campaign.id) %>
+                  <span class={status_badge_class(if retrying, do: "retrying", else: campaign.status)}>
+                    <%= if retrying, do: "retrying", else: campaign.status %>
                   </span>
                 </td>
                 <td class="px-4 py-2 whitespace-nowrap">
@@ -162,7 +185,15 @@ defmodule TitanFlowWeb.CampaignsLive do
     <% end %>
 
     <%= if @selected_campaign do %>
-      <.stats_modal campaign={@selected_campaign} stats={@live_stats} template_stats={@template_stats} failed_messages={@failed_messages} mps={@current_mps} />
+      <.stats_modal
+        campaign={@selected_campaign}
+        stats={@live_stats}
+        template_stats={@template_stats}
+        failed_messages={@failed_messages}
+        mps={@current_mps}
+        retrying={MapSet.member?(@retrying_campaigns, @selected_campaign.id)}
+        webhook_queue_depth={@webhook_queue_depth}
+      />
     <% end %>
     """
   end
@@ -172,27 +203,42 @@ defmodule TitanFlowWeb.CampaignsLive do
     require Logger
     Logger.info("DEBUG: show_stats clicked for id #{id}")
     campaign = Campaigns.get_campaign!(id)
+    queue_depth = Campaigns.webhook_queue_depth()
+    running_campaigns? = Campaigns.running_campaigns?()
     # Start polling if running
     if connected?(socket), do: Process.send_after(self(), :tick, 2000)
-    
+
     initial_stats = TitanFlow.Campaigns.MessageTracking.get_realtime_stats(campaign.id)
-    
-    template_stats = if campaign.status == "completed" do
-       TitanFlow.Campaigns.MessageTracking.get_template_breakdown(campaign.id)
-    else
-       nil
-    end
-    
+
+    # SYNC FIX: Update campaign DB record with realtime stats on popup open
+    # This ensures page shows updated stats on refresh
+    Campaigns.update_campaign(campaign, %{
+      sent_count: initial_stats.sent_count,
+      delivered_count: initial_stats.delivered_count,
+      read_count: initial_stats.read_count,
+      failed_count: initial_stats.failed_count
+    })
+
+    template_stats =
+      if campaign.status == "completed" do
+        TitanFlow.Campaigns.MessageTracking.get_template_breakdown(campaign.id)
+      else
+        nil
+      end
+
     # Fetch failed messages with error details
     failed_messages = TitanFlow.Campaigns.MessageTracking.get_failed_messages(campaign.id, 50)
-    
-    {:noreply, assign(socket, 
-      selected_campaign: campaign, 
-      live_stats: initial_stats,
-      template_stats: template_stats,
-      failed_messages: failed_messages,
-      current_mps: 0.0
-    )}
+
+    {:noreply,
+     assign(socket,
+       selected_campaign: campaign,
+       live_stats: initial_stats,
+       template_stats: template_stats,
+       failed_messages: failed_messages,
+       current_mps: 0.0,
+       webhook_queue_depth: queue_depth,
+       running_campaigns?: running_campaigns?
+     )}
   end
 
   @impl true
@@ -203,13 +249,17 @@ defmodule TitanFlowWeb.CampaignsLive do
   @impl true
   def handle_event("pause_campaign", %{"id" => id}, socket) do
     alias TitanFlow.Campaigns.Orchestrator
+
     case Orchestrator.pause_campaign(String.to_integer(id)) do
       {:ok, _} ->
         page_data = Campaigns.list_campaigns(socket.assigns.page, @per_page)
         campaign = Campaigns.get_campaign!(id)
-        {:noreply, socket
-          |> assign(campaigns: page_data.entries, selected_campaign: campaign)
-          |> put_flash(:info, "Campaign paused")}
+
+        {:noreply,
+         socket
+         |> assign(campaigns: page_data.entries, selected_campaign: campaign)
+         |> put_flash(:info, "Campaign paused")}
+
       {:error, _} ->
         {:noreply, put_flash(socket, :error, "Failed to pause campaign")}
     end
@@ -218,13 +268,17 @@ defmodule TitanFlowWeb.CampaignsLive do
   @impl true
   def handle_event("resume_campaign", %{"id" => id}, socket) do
     alias TitanFlow.Campaigns.Orchestrator
+
     case Orchestrator.resume_campaign(String.to_integer(id)) do
       {:ok, _} ->
         page_data = Campaigns.list_campaigns(socket.assigns.page, @per_page)
         campaign = Campaigns.get_campaign!(id)
-        {:noreply, socket
-          |> assign(campaigns: page_data.entries, selected_campaign: campaign)
-          |> put_flash(:info, "Campaign resumed")}
+
+        {:noreply,
+         socket
+         |> assign(campaigns: page_data.entries, selected_campaign: campaign)
+         |> put_flash(:info, "Campaign resumed")}
+
       {:error, _} ->
         {:noreply, put_flash(socket, :error, "Failed to resume campaign")}
     end
@@ -234,38 +288,54 @@ defmodule TitanFlowWeb.CampaignsLive do
   def handle_event("retry_failed", %{"id" => id}, socket) do
     alias TitanFlow.Campaigns.Orchestrator
     campaign_id = String.to_integer(id)
-    
+
     # Start retry in background task to not block UI
+    caller = self()
+
     Task.start(fn ->
-      Orchestrator.retry_failed_contacts(campaign_id)
+      result = Orchestrator.retry_failed_contacts(campaign_id)
+      send(caller, {:retry_failed_result, campaign_id, result})
     end)
-    
+
     page_data = Campaigns.list_campaigns(socket.assigns.page, @per_page)
     campaign = Campaigns.get_campaign!(id)
-    
-    {:noreply, socket
-      |> assign(campaigns: page_data.entries, selected_campaign: campaign)
-      |> put_flash(:info, "Retrying failed contacts... Templates synced and campaign restarted.")}
+
+    Process.send_after(self(), :refresh_campaigns, 2_000)
+
+    {:noreply,
+     socket
+     |> assign(
+       campaigns: page_data.entries,
+       selected_campaign: campaign,
+       retrying_campaigns: MapSet.put(socket.assigns.retrying_campaigns, campaign_id)
+     )
+     |> put_flash(:info, "Retrying failed contacts... Templates synced and campaign restarted.")}
   end
 
   @impl true
   def handle_event("delete_draft", %{"id" => id}, socket) do
     id = String.to_integer(id)
     campaign = Campaigns.get_campaign!(id)
-    
+
     if campaign.status == "draft" do
       # Delete contacts first (FK constraint)
       import Ecto.Query
       TitanFlow.Repo.delete_all(from c in "contacts", where: c.campaign_id == ^id)
-      
+
       # Delete campaign
       Campaigns.delete_campaign(campaign)
-      
+
       # Refresh list with pagination
       page_data = Campaigns.list_campaigns(socket.assigns.page, @per_page)
-      {:noreply, socket
-        |> assign(campaigns: page_data.entries, total: page_data.total, total_pages: page_data.total_pages)
-        |> put_flash(:info, "Draft campaign deleted")}
+
+      {:noreply,
+       socket
+       |> assign(
+         campaigns: page_data.entries,
+         total: page_data.total,
+         total_pages: page_data.total_pages
+       )
+       |> put_flash(:info, "Draft campaign deleted")}
     else
       {:noreply, put_flash(socket, :error, "Can only delete draft campaigns")}
     end
@@ -275,72 +345,157 @@ defmodule TitanFlowWeb.CampaignsLive do
   def handle_event("prev_page", _, socket) do
     new_page = max(1, socket.assigns.page - 1)
     page_data = Campaigns.list_campaigns(new_page, @per_page)
-    
-    {:noreply, assign(socket,
-      campaigns: page_data.entries,
-      page: page_data.page,
-      total_pages: page_data.total_pages,
-      total: page_data.total
-    )}
+
+    {:noreply,
+     assign(socket,
+       campaigns: page_data.entries,
+       page: page_data.page,
+       total_pages: page_data.total_pages,
+       total: page_data.total
+     )}
   end
 
   @impl true
   def handle_event("next_page", _, socket) do
     new_page = min(socket.assigns.total_pages, socket.assigns.page + 1)
     page_data = Campaigns.list_campaigns(new_page, @per_page)
-    
-    {:noreply, assign(socket,
-      campaigns: page_data.entries,
-      page: page_data.page,
-      total_pages: page_data.total_pages,
-      total: page_data.total
-    )}
+
+    {:noreply,
+     assign(socket,
+       campaigns: page_data.entries,
+       page: page_data.page,
+       total_pages: page_data.total_pages,
+       total: page_data.total
+     )}
   end
 
   @impl true
   def handle_info(:tick, socket) do
     if socket.assigns.selected_campaign do
-      Process.send_after(self(), :tick, 5000)  # 5 second polling interval
-      
+      # 10 second polling interval
+      Process.send_after(self(), :tick, 10_000)
+
       # Reload campaign to check for status updates / timestamps
       campaign_id = socket.assigns.selected_campaign.id
       campaign = Campaigns.get_campaign!(campaign_id)
-      
+
       new_stats = TitanFlow.Campaigns.MessageTracking.get_realtime_stats(campaign_id)
-      
+
       # Only fetch template_stats once when campaign completes (not on every tick)
-      template_stats = if campaign.status == "completed" and socket.assigns[:template_stats] == nil do
-         TitanFlow.Campaigns.MessageTracking.get_template_breakdown(campaign.id)
-      else
-         socket.assigns[:template_stats]
-      end
-      
-      # Calculate MPS based on 5 second interval
+      template_stats =
+        if campaign.status == "completed" and socket.assigns[:template_stats] == nil do
+          TitanFlow.Campaigns.MessageTracking.get_template_breakdown(campaign.id)
+        else
+          socket.assigns[:template_stats]
+        end
+
+      # Calculate MPS based on 10 second interval
       old_sent = socket.assigns.live_stats.sent_count || 0
       new_sent = new_stats.sent_count || 0
-      mps = max(0.0, (new_sent - old_sent) / 5.0)
-      
+      mps = max(0.0, (new_sent - old_sent) / 10.0)
+
       # MEMORY OPTIMIZATION: Don't reload failed_messages on every tick
       # Keep the initial list that was loaded when modal opened
-      {:noreply, assign(socket, 
+      {:noreply,
+       assign(socket,
          selected_campaign: campaign,
-         live_stats: new_stats, 
+         live_stats: new_stats,
          template_stats: template_stats,
          current_mps: mps
          # failed_messages intentionally NOT updated - stays from initial load
-      )}
+       )}
     else
       {:noreply, socket}
     end
   end
 
+  @impl true
+  def handle_info(:queue_tick, socket) do
+    queue_depth = Campaigns.webhook_queue_depth()
+    running_campaigns? = Campaigns.running_campaigns?()
+
+    Process.send_after(self(), :queue_tick, @queue_check_interval_ms)
+
+    {:noreply,
+     assign(socket,
+       webhook_queue_depth: queue_depth,
+       running_campaigns?: running_campaigns?
+     )}
+  end
+
+  @impl true
+  def handle_info({:retry_failed_result, campaign_id, result}, socket) do
+    socket =
+      case result do
+        {:ok, :retry_started} ->
+          socket
+
+        {:error, reason} ->
+          socket
+          |> assign(
+            retrying_campaigns: MapSet.delete(socket.assigns.retrying_campaigns, campaign_id)
+          )
+          |> put_flash(:error, "Retry failed to start: #{inspect(reason)}")
+
+        _ ->
+          socket
+          |> assign(
+            retrying_campaigns: MapSet.delete(socket.assigns.retrying_campaigns, campaign_id)
+          )
+          |> put_flash(:error, "Retry failed to start")
+      end
+
+    if MapSet.size(socket.assigns.retrying_campaigns) > 0 do
+      Process.send_after(self(), :refresh_campaigns, 2_000)
+    end
+
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_info(:refresh_campaigns, socket) do
+    page_data = Campaigns.list_campaigns(socket.assigns.page, @per_page)
+
+    {retrying_campaigns, completed_names} =
+      update_retrying_campaigns(socket.assigns.retrying_campaigns, page_data.entries)
+
+    socket =
+      socket
+      |> assign(
+        campaigns: page_data.entries,
+        page: page_data.page,
+        total_pages: page_data.total_pages,
+        total: page_data.total,
+        retrying_campaigns: retrying_campaigns
+      )
+
+    socket =
+      case completed_names do
+        [] ->
+          socket
+
+        [name] ->
+          put_flash(socket, :info, "Retry completed for #{name}")
+
+        names ->
+          put_flash(socket, :info, "Retries completed for #{length(names)} campaigns")
+      end
+
+    if MapSet.size(retrying_campaigns) > 0 do
+      Process.send_after(self(), :refresh_campaigns, 3_000)
+    end
+
+    {:noreply, socket}
+  end
+
   defp status_badge_class(status) do
     base = "inline-flex items-center px-2 py-0.5 rounded text-xs font-medium"
-    
+
     case status do
       "draft" -> "#{base} bg-zinc-700/50 text-zinc-400 border border-zinc-700"
       "pending" -> "#{base} bg-amber-500/20 text-amber-400 border border-amber-500/30"
       "running" -> "#{base} bg-blue-500/20 text-blue-400 border border-blue-500/30"
+      "retrying" -> "#{base} bg-orange-500/20 text-orange-400 border border-orange-500/30"
       "completed" -> "#{base} bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
       "failed" -> "#{base} bg-red-500/20 text-red-400 border border-red-500/30"
       "paused" -> "#{base} bg-zinc-700/50 text-zinc-400 border border-zinc-700"
@@ -349,7 +504,32 @@ defmodule TitanFlowWeb.CampaignsLive do
     end
   end
 
+  defp update_retrying_campaigns(retrying_campaigns, campaigns) do
+    {completed_ids, completed_names} =
+      retrying_campaigns
+      |> Enum.reduce({[], []}, fn campaign_id, {ids, names} ->
+        case Enum.find(campaigns, &(&1.id == campaign_id)) do
+          nil ->
+            {ids, names}
+
+          campaign when campaign.status in ["completed", "paused"] ->
+            {[campaign.id | ids], [campaign.name | names]}
+
+          _ ->
+            {ids, names}
+        end
+      end)
+
+    updated_retrying =
+      Enum.reduce(completed_ids, retrying_campaigns, fn campaign_id, acc ->
+        MapSet.delete(acc, campaign_id)
+      end)
+
+    {updated_retrying, Enum.reverse(completed_names)}
+  end
+
   defp format_datetime(nil), do: "-"
+
   defp format_datetime(datetime) do
     TitanFlowWeb.DateTimeHelpers.format_datetime(datetime)
   end
@@ -357,7 +537,7 @@ defmodule TitanFlowWeb.CampaignsLive do
   defp progress_percent(campaign) do
     total = campaign.total_records || 0
     processed = (campaign.sent_count || 0) + (campaign.failed_count || 0)
-    
+
     if total > 0 do
       round(processed / total * 100)
     else
@@ -368,57 +548,72 @@ defmodule TitanFlowWeb.CampaignsLive do
   defp stats_modal(assigns) do
     # Smart Stats Logic
     raw = assigns.stats
-    
+
     # NOTE: delivered_count from get_realtime_stats ALREADY includes read 
     # (it's calculated as delivered + read statuses), so don't add again!
     effective_delivered = raw.delivered_count
-    
+
     # Read count is already accurate from get_realtime_stats
     effective_read = raw.read_count
-    
+
     replied = raw.replied_count
     sent = raw.sent_count
-    
+
     # Calculate percentages
-    pct = fn val -> 
+    pct = fn val ->
       if sent > 0, do: Float.round(val / sent * 100, 1), else: 0.0
     end
-    
+
     # Calculate Duration and Avg Speed
-    {duration_str, avg_speed} = if assigns.campaign.status == "completed" && assigns.campaign.started_at && assigns.campaign.completed_at do
-      duration = NaiveDateTime.diff(assigns.campaign.completed_at, assigns.campaign.started_at)
-      speed = if duration > 0, do: raw.sent_count / duration, else: 0.0
-      
-      hours = div(duration, 3600)
-      minutes = div(rem(duration, 3600), 60)
-      seconds = rem(duration, 60)
-      
-      dur_str = cond do
-        hours > 0 -> "#{hours}h #{minutes}m"
-        minutes > 0 -> "#{minutes}m #{seconds}s"
-        true -> "#{seconds}s"
+    {duration_str, avg_speed} =
+      if assigns.campaign.status == "completed" && assigns.campaign.started_at &&
+           assigns.campaign.completed_at do
+        duration = NaiveDateTime.diff(assigns.campaign.completed_at, assigns.campaign.started_at)
+        speed = if duration > 0, do: raw.sent_count / duration, else: 0.0
+
+        hours = div(duration, 3600)
+        minutes = div(rem(duration, 3600), 60)
+        seconds = rem(duration, 60)
+
+        dur_str =
+          cond do
+            hours > 0 -> "#{hours}h #{minutes}m"
+            minutes > 0 -> "#{minutes}m #{seconds}s"
+            true -> "#{seconds}s"
+          end
+
+        {dur_str, speed}
+      else
+        {"-", 0.0}
       end
-      
-      {dur_str, speed}
-    else
-      {"-", 0.0}
-    end
 
     alias TitanFlowWeb.DateTimeHelpers
-    campaign_started_at = if assigns.campaign.started_at, do: DateTimeHelpers.format_datetime_with_seconds(assigns.campaign.started_at), else: "-"
-    campaign_completed_at = if assigns.campaign.completed_at, do: DateTimeHelpers.format_datetime_with_seconds(assigns.campaign.completed_at), else: "-"
-    
-    assigns = assigns
-    |> assign(:eff_delivered, effective_delivered)
-    |> assign(:eff_read, effective_read)
-    |> assign(:replied, replied)
-    |> assign(:pct_delivered, pct.(effective_delivered))
-    |> assign(:pct_read, pct.(effective_read))
-    |> assign(:pct_replied, pct.(replied))
-    |> assign(:duration_str, duration_str)
-    |> assign(:avg_speed, avg_speed)
-    |> assign(:started_at, campaign_started_at)
-    |> assign(:completed_at, campaign_completed_at)
+
+    campaign_started_at =
+      if assigns.campaign.started_at,
+        do: DateTimeHelpers.format_datetime_with_seconds(assigns.campaign.started_at),
+        else: "-"
+
+    campaign_completed_at =
+      if assigns.campaign.completed_at,
+        do: DateTimeHelpers.format_datetime_with_seconds(assigns.campaign.completed_at),
+        else: "-"
+
+    queue_warn = assigns.webhook_queue_depth >= @webhook_queue_warn_threshold
+
+    assigns =
+      assigns
+      |> assign(:eff_delivered, effective_delivered)
+      |> assign(:eff_read, effective_read)
+      |> assign(:replied, replied)
+      |> assign(:pct_delivered, pct.(effective_delivered))
+      |> assign(:pct_read, pct.(effective_read))
+      |> assign(:pct_replied, pct.(replied))
+      |> assign(:duration_str, duration_str)
+      |> assign(:avg_speed, avg_speed)
+      |> assign(:started_at, campaign_started_at)
+      |> assign(:completed_at, campaign_completed_at)
+      |> assign(:webhook_queue_warn, queue_warn)
 
     ~H"""
     <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" phx-click="close_stats">
@@ -436,6 +631,17 @@ defmodule TitanFlowWeb.CampaignsLive do
                  <span>Duration: <span class="font-mono text-zinc-300"><%= @duration_str %></span></span>
                <% else %>
                  <span>Real-time: <span class="font-mono text-indigo-400 font-medium"><%= Float.round(@mps, 1) %> msg/s</span></span>
+               <% end %>
+               <span>•</span>
+               <span>
+                 Webhook queue:
+                 <span class={"font-mono font-medium " <> if @webhook_queue_warn, do: "text-amber-400", else: "text-zinc-300"}>
+                   <%= @webhook_queue_depth %>
+                 </span>
+               </span>
+               <%= if @retrying do %>
+                 <span>•</span>
+                 <span class="text-orange-400 font-medium">Retry in progress</span>
                <% end %>
             </div>
           </div>
@@ -588,9 +794,15 @@ defmodule TitanFlowWeb.CampaignsLive do
               <button 
                 phx-click="retry_failed" 
                 phx-value-id={@campaign.id}
-                class="flex-1 h-9 px-4 bg-orange-600 hover:bg-orange-500 text-white rounded-md font-medium text-sm transition-colors"
+                disabled={@retrying}
+                class={"flex-1 h-9 px-4 text-white rounded-md font-medium text-sm transition-colors " <>
+                  if @retrying, do: "bg-orange-900/60 cursor-not-allowed", else: "bg-orange-600 hover:bg-orange-500"}
               >
-                🔄 Retry Failed (<%= @stats.failed_count %>)
+                <%= if @retrying do %>
+                  ⏳ Retrying...
+                <% else %>
+                  🔄 Retry Failed (<%= @stats.failed_count %>)
+                <% end %>
               </button>
             </div>
           <% end %>
@@ -616,7 +828,7 @@ defmodule TitanFlowWeb.CampaignsLive do
                            <span class="font-medium">(#<%= msg.error_code || "?" %>)</span> <%= msg.error_message || "Unknown error" %>
                          </td>
                          <td class="px-4 py-2 text-zinc-500 text-xs font-mono">
-                           <%= if msg.sent_at, do: Calendar.strftime(msg.sent_at, "%m/%d/%Y, %H:%M:%S"), else: "-" %>
+                           <%= if msg.sent_at, do: DateTimeHelpers.format_table_datetime(msg.sent_at), else: "-" %>
                          </td>
                        </tr>
                      <% end %>

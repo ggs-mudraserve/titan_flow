@@ -2,7 +2,6 @@ defmodule TitanFlowWeb.NumberLive.FormComponent do
   use TitanFlowWeb, :live_component
 
   alias TitanFlow.WhatsApp
-  alias TitanFlow.WhatsApp.PhoneNumber
 
   @impl true
   def render(assigns) do
@@ -100,7 +99,6 @@ defmodule TitanFlowWeb.NumberLive.FormComponent do
             </div>
           </div>
 
-          <!-- Access Token -->
       <div class="mb-4">
         <label class="block text-sm font-medium text-gray-300 mb-2">Access Token</label>
         <input
@@ -112,8 +110,6 @@ defmodule TitanFlowWeb.NumberLive.FormComponent do
         />
         <p class="mt-1 text-xs text-gray-500">Permanent access token from Meta Business Suite</p>
       </div>
-
-
 
           <!-- AI System Prompt -->
           <div class="pt-4 border-t border-gray-700">
@@ -153,9 +149,10 @@ defmodule TitanFlowWeb.NumberLive.FormComponent do
   def update(%{phone_number: phone_number} = assigns, socket) do
     changeset = WhatsApp.change_phone_number(phone_number)
 
-    {:ok, socket
-      |> assign(assigns)
-      |> assign_form(changeset)}
+    {:ok,
+     socket
+     |> assign(assigns)
+     |> assign_form(changeset)}
   end
 
   @impl true
@@ -177,9 +174,12 @@ defmodule TitanFlowWeb.NumberLive.FormComponent do
     case WhatsApp.update_phone_number(socket.assigns.phone_number, phone_number_params) do
       {:ok, phone_number} ->
         notify_parent({:saved, phone_number})
-        {:noreply, socket
-          |> put_flash(:info, "Phone number updated!")
-          |> push_patch(to: socket.assigns.patch)}
+
+        {:noreply,
+         socket
+         |> put_flash(:info, "Phone number updated!")
+         |> push_patch(to: socket.assigns.patch)}
+
       {:error, %Ecto.Changeset{} = changeset} ->
         {:noreply, assign_form(socket, changeset)}
     end
@@ -189,9 +189,12 @@ defmodule TitanFlowWeb.NumberLive.FormComponent do
     case WhatsApp.create_phone_number(phone_number_params) do
       {:ok, phone_number} ->
         notify_parent({:saved, phone_number})
-        {:noreply, socket
-          |> put_flash(:info, "Phone number added!")
-          |> push_patch(to: socket.assigns.patch)}
+
+        {:noreply,
+         socket
+         |> put_flash(:info, "Phone number added!")
+         |> push_patch(to: socket.assigns.patch)}
+
       {:error, %Ecto.Changeset{} = changeset} ->
         {:noreply, assign_form(socket, changeset)}
     end

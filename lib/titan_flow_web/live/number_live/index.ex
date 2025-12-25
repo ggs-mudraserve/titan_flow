@@ -23,6 +23,7 @@ defmodule TitanFlowWeb.NumberLive.Index do
 
   defp apply_action(socket, :edit, %{"id" => id}) do
     phone_number = WhatsApp.get_phone_number!(id)
+
     socket
     |> assign(:page_title, "Edit Phone Number")
     |> assign(:phone_number, phone_number)
@@ -46,41 +47,44 @@ defmodule TitanFlowWeb.NumberLive.Index do
   end
 
   @impl true
+  def handle_info({:sync_complete, _id, result}, socket) do
+    socket = assign(socket, syncing: nil)
+
+    socket =
+      case result do
+        {:ok, _} ->
+          socket
+          |> put_flash(:info, "Phone number synced successfully!")
+          |> load_phone_numbers()
+
+        {:error, reason} ->
+          put_flash(socket, :error, "Sync failed: #{inspect(reason)}")
+      end
+
+    {:noreply, socket}
+  end
+
+  @impl true
   def handle_event("delete", %{"id" => id}, socket) do
     phone_number = WhatsApp.get_phone_number!(id)
     {:ok, _} = WhatsApp.delete_phone_number(phone_number)
-    
-    {:noreply, socket
-      |> put_flash(:info, "Phone number deleted!")
-      |> load_phone_numbers()}
+
+    {:noreply,
+     socket
+     |> put_flash(:info, "Phone number deleted!")
+     |> load_phone_numbers()}
   end
 
   @impl true
   def handle_event("sync", %{"id" => id}, socket) do
     phone_number = WhatsApp.get_phone_number!(id)
     socket = assign(socket, syncing: String.to_integer(id))
-    
+
     Task.start(fn ->
       result = WhatsApp.sync_phone_number(phone_number)
       send(self(), {:sync_complete, id, result})
     end)
-    
-    {:noreply, socket}
-  end
 
-  @impl true
-  def handle_info({:sync_complete, _id, result}, socket) do
-    socket = assign(socket, syncing: nil)
-    
-    socket = case result do
-      {:ok, _} -> 
-        socket
-        |> put_flash(:info, "Phone number synced successfully!")
-        |> load_phone_numbers()
-      {:error, reason} ->
-        put_flash(socket, :error, "Sync failed: #{inspect(reason)}")
-    end
-    
     {:noreply, socket}
   end
 

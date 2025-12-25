@@ -11,9 +11,12 @@ config :titan_flow,
   ecto_repos: [TitanFlow.Repo],
   generators: [timestamp_type: :naive_datetime]
 
+config :titan_flow, :secure_cookies, config_env() == :prod
+
 # Feature Flags - Easy rollback by setting to false
 config :titan_flow, :features,
-  use_fast_importer: true  # ENABLED: Using 10x faster PostgreSQL COPY importer
+  # ENABLED: Using 10x faster PostgreSQL COPY importer
+  use_fast_importer: true
 
 # Configure the endpoint
 config :titan_flow, TitanFlowWeb.Endpoint,

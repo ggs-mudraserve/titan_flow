@@ -22,11 +22,14 @@ defmodule TitanFlow.Repo.Migrations.AddInboxTables do
 
     create table(:messages) do
       add :conversation_id, references(:conversations, on_delete: :delete_all), null: false
-      add :direction, :text, null: false  # "inbound" or "outbound"
+      # "inbound" or "outbound"
+      add :direction, :text, null: false
       add :content, :text
-      add :message_type, :text, default: "text"  # text, image, video, template
+      # text, image, video, template
+      add :message_type, :text, default: "text"
       add :meta_message_id, :text
-      add :status, :text  # sent, delivered, read, failed
+      # sent, delivered, read, failed
+      add :status, :text
       add :template_name, :text
       add :is_ai_generated, :boolean, default: false
 

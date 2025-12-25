@@ -8,7 +8,9 @@ defmodule TitanFlowWeb.Endpoint do
     store: :cookie,
     key: "_titan_flow_key",
     signing_salt: "JeCm+jDI",
-    same_site: "Lax"
+    encryption_salt: "i/6kx1pc5IBLbZylMrmIEGANRg8ikrdzdR9bTkAy5bU=",
+    same_site: "Strict",
+    secure: Application.compile_env(:titan_flow, :secure_cookies, true)
   ]
 
   socket "/live", Phoenix.LiveView.Socket,
@@ -44,10 +46,38 @@ defmodule TitanFlowWeb.Endpoint do
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
+    body_reader: {TitanFlowWeb.Endpoint, :read_body, []},
     json_decoder: Phoenix.json_library()
 
   plug Plug.MethodOverride
   plug Plug.Head
   plug Plug.Session, @session_options
   plug TitanFlowWeb.Router
+
+  def read_body(conn, opts) do
+    case Plug.Conn.read_body(conn, opts) do
+      {:ok, body, conn} ->
+        {:ok, body, maybe_put_raw_body(conn, body)}
+
+      {:more, body, conn} ->
+        {:more, body, maybe_put_raw_body(conn, body)}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp put_raw_body(conn, body) do
+    existing = conn.assigns[:raw_body] || ""
+    Plug.Conn.assign(conn, :raw_body, existing <> body)
+  end
+
+  defp maybe_put_raw_body(conn, body) do
+    if conn.request_path == "/api/webhooks" or
+         String.starts_with?(conn.request_path, "/api/webhooks/") do
+      put_raw_body(conn, body)
+    else
+      conn
+    end
+  end
 end

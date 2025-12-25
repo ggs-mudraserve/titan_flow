@@ -8,7 +8,8 @@ defmodule TitanFlow.Repo.Migrations.CreateMessageLogs do
       add :contact_id, references(:contacts, on_delete: :delete_all)
       add :phone_number_id, :text
       add :recipient_phone, :text
-      add :status, :text, default: "sent"  # sent, delivered, read, failed
+      # sent, delivered, read, failed
+      add :status, :text, default: "sent"
       add :error_code, :text
       add :error_message, :text
       add :sent_at, :utc_datetime

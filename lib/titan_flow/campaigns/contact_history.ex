@@ -1,7 +1,7 @@
 defmodule TitanFlow.Campaigns.ContactHistory do
   @moduledoc """
   Schema for the contact_history table - a lightweight lookup table for instant deduplication.
-  
+
   This table maintains a single row per phone number with the most recent contact timestamp.
   Much more efficient than scanning message_logs for deduplication checks.
   """

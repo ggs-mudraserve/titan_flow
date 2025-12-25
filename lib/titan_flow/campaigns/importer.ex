@@ -1,12 +1,12 @@
 defmodule TitanFlow.Campaigns.Importer do
   @moduledoc """
   Handles massive CSV imports efficiently using streaming and batch inserts.
-  
+
   Supports multiple file formats for faster uploads:
   - Plain CSV (.csv)
   - GZIP compressed CSV (.gz) - Best compression, 70-80% smaller
   - ZIP archive (.zip) - Windows-friendly, extracts first CSV file
-  
+
   Optimized for speed with:
   - Streaming CSV parsing (no full file load into memory)
   - Streaming decompression via system commands
@@ -27,18 +27,10 @@ defmodule TitanFlow.Campaigns.Importer do
 
   @doc """
   Import contacts from a CSV, GZIP, or ZIP file into a campaign.
-  
-  Automatically detects file type and decompresses on-the-fly.
-  
-  OPTIMIZED: Uses streaming + chunked batch inserts for maximum speed.
-  Expected performance: 5,000-10,000 contacts/second on typical hardware.
-  """
-  @doc """
-  Import contacts from a CSV, GZIP, or ZIP file into a campaign.
-  
+
   Automatically detects file type and decompresses on-the-fly.
   Performs batch deduplication against contact_history if enabled.
-  
+
   OPTIMIZED: Uses streaming + chunked batch inserts for maximum speed.
   """
   @spec import_csv(String.t(), integer()) :: {:ok, integer()} | {:error, term()}
@@ -61,44 +53,50 @@ defmodule TitanFlow.Campaigns.Importer do
     start_time = System.monotonic_time(:millisecond)
     now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
     dedup_window = campaign.dedup_window_days || 0
-    cutoff_date = if dedup_window > 0 do
-      NaiveDateTime.add(now, -dedup_window * 86400, :second)
-    else
-      nil
-    end
+
+    cutoff_date =
+      if dedup_window > 0 do
+        NaiveDateTime.add(now, -dedup_window * 86400, :second)
+      else
+        nil
+      end
 
     try do
-      {inserted_count, skipped_count} =
+      # Use a MapSet to track all seen phone numbers for global deduplication
+      {inserted_count, skipped_count, _seen_phones} =
         file_path
         |> file_stream()
         |> CSVParser.parse_stream(skip_headers: true)
         |> Stream.map(fn row -> row_to_contact(row, campaign.id, now) end)
         |> Stream.chunk_every(@batch_size)
-        |> Enum.reduce({0, 0}, fn batch, {acc_inserted, acc_skipped} ->
-          # Filter duplicates if window is active
-          {valid_batch, batch_skipped} = 
+        |> Enum.reduce({0, 0, MapSet.new()}, fn batch, {acc_inserted, acc_skipped, seen_phones} ->
+          # Step 1: Deduplicate within batch AND against already seen phones
+          {unique_batch, new_seen, batch_csv_dupes} = dedupe_batch(batch, seen_phones)
+
+          # Step 2: Filter against contact_history if dedup window is active
+          {valid_batch, history_skipped} =
             if cutoff_date do
-              filter_duplicates(batch, cutoff_date)
+              filter_duplicates(unique_batch, cutoff_date)
             else
-              {batch, 0}
+              {unique_batch, 0}
             end
-            
-          # Insert valid contacts
-          inserted = 
+
+          # Step 3: Insert valid contacts
+          inserted =
             if valid_batch != [] do
               {count, _} = Repo.insert_all("contacts", valid_batch, on_conflict: :nothing)
               count
             else
               0
             end
-            
+
           total_inserted = acc_inserted + inserted
-          total_skipped = acc_skipped + batch_skipped
-          
+          total_skipped = acc_skipped + batch_csv_dupes + history_skipped
+
           # Report progress (total processed records)
           progress_fn.(total_inserted + total_skipped)
-          
-          {total_inserted, total_skipped}
+
+          {total_inserted, total_skipped, new_seen}
         end)
 
       # Update campaign with final counts
@@ -110,9 +108,12 @@ defmodule TitanFlow.Campaigns.Importer do
       elapsed_ms = System.monotonic_time(:millisecond) - start_time
       total_processed = inserted_count + skipped_count
       rate = if elapsed_ms > 0, do: round(total_processed / elapsed_ms * 1000), else: 0
-      
+
       file_type = detect_file_type(file_path)
-      Logger.info("#{file_type} Import: #{inserted_count} inserted, #{skipped_count} skipped in #{elapsed_ms}ms (#{rate}/sec)")
+
+      Logger.info(
+        "#{file_type} Import: #{inserted_count} inserted, #{skipped_count} skipped in #{elapsed_ms}ms (#{rate}/sec)"
+      )
 
       {:ok, inserted_count}
     rescue
@@ -128,11 +129,11 @@ defmodule TitanFlow.Campaigns.Importer do
   defp filter_duplicates(batch, cutoff_date) do
     # Extract phone numbers from batch
     phones = Enum.map(batch, & &1.phone)
-    
+
     # Query contact_history for recently contacted phones
     import Ecto.Query
-    
-    recent_phones = 
+
+    recent_phones =
       from(h in "contact_history",
         where: h.phone_number in ^phones,
         where: h.last_sent_at >= ^cutoff_date,
@@ -140,13 +141,32 @@ defmodule TitanFlow.Campaigns.Importer do
       )
       |> Repo.all()
       |> MapSet.new()
-      
+
     # Identify valid and skipped contacts
-    {valid, skipped} = Enum.split_with(batch, fn contact -> 
-      not MapSet.member?(recent_phones, contact.phone)
-    end)
-    
+    {valid, skipped} =
+      Enum.split_with(batch, fn contact ->
+        not MapSet.member?(recent_phones, contact.phone)
+      end)
+
     {valid, length(skipped)}
+  end
+
+  # Deduplicate contacts within batch AND against already seen phones
+  # Returns {unique_contacts, updated_seen_set, duplicate_count}
+  defp dedupe_batch(batch, seen_phones) do
+    {unique, new_seen, dupe_count} =
+      Enum.reduce(batch, {[], seen_phones, 0}, fn contact, {acc, seen, dupes} ->
+        if MapSet.member?(seen, contact.phone) do
+          # Already seen this phone - skip it
+          {acc, seen, dupes + 1}
+        else
+          # New phone - add to output and mark as seen
+          {[contact | acc], MapSet.put(seen, contact.phone), dupes}
+        end
+      end)
+
+    # Reverse to maintain order (since we prepend)
+    {Enum.reverse(unique), new_seen, dupe_count}
   end
 
   # Private Functions
@@ -165,11 +185,11 @@ defmodule TitanFlow.Campaigns.Importer do
       String.ends_with?(file_path, ".gz") ->
         Logger.info("Detected GZIP file, using streaming decompression")
         gzip_stream(file_path)
-        
+
       String.ends_with?(file_path, ".zip") ->
         Logger.info("Detected ZIP file, extracting CSV content")
         zip_stream(file_path)
-        
+
       true ->
         File.stream!(file_path, read_ahead: 100_000)
     end
@@ -189,14 +209,14 @@ defmodule TitanFlow.Campaigns.Importer do
             lines = String.split(combined, "\n")
             {complete_lines, [new_buffer]} = Enum.split(lines, -1)
             {complete_lines, {port, new_buffer}}
-            
+
           {^port, {:exit_status, 0}} ->
             if buffer != "" do
               {[buffer], {port, ""}}
             else
               {:halt, {port, ""}}
             end
-            
+
           {^port, {:exit_status, status}} ->
             Logger.error("gzip decompression failed with status #{status}")
             {:halt, {port, ""}}
@@ -221,14 +241,20 @@ defmodule TitanFlow.Campaigns.Importer do
   defp zip_stream(path) do
     # First, find the CSV file inside the ZIP
     csv_filename = find_csv_in_zip(path)
-    
+
     if csv_filename do
       Logger.info("Found CSV in ZIP: #{csv_filename}")
-      
+
       Stream.resource(
         fn ->
           # unzip -p extracts to stdout
-          port = Port.open({:spawn, "unzip -p #{path} \"#{csv_filename}\""}, [:binary, :exit_status, :use_stdio])
+          port =
+            Port.open({:spawn, "unzip -p #{path} \"#{csv_filename}\""}, [
+              :binary,
+              :exit_status,
+              :use_stdio
+            ])
+
           {port, ""}
         end,
         fn {port, buffer} ->
@@ -238,14 +264,14 @@ defmodule TitanFlow.Campaigns.Importer do
               lines = String.split(combined, "\n")
               {complete_lines, [new_buffer]} = Enum.split(lines, -1)
               {complete_lines, {port, new_buffer}}
-              
+
             {^port, {:exit_status, 0}} ->
               if buffer != "" do
                 {[buffer], {port, ""}}
               else
                 {:halt, {port, ""}}
               end
-              
+
             {^port, {:exit_status, status}} ->
               Logger.error("unzip extraction failed with status #{status}")
               {:halt, {port, ""}}
@@ -287,7 +313,7 @@ defmodule TitanFlow.Campaigns.Importer do
             _ -> nil
           end
         end)
-        
+
       {error, _} ->
         Logger.error("Failed to list ZIP contents: #{error}")
         nil

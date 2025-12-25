@@ -18,19 +18,32 @@ defmodule TitanFlow.WhatsApp.PhoneNumber do
     field :is_warmup_active, :boolean, default: false
     field :warmup_started_at, :utc_datetime
     field :system_prompt, :string, default: "You are a helpful assistant. Keep answers short."
+    # Messages Per Second limit (10-500)
+    field :max_mps, :integer, default: 80
 
     timestamps()
   end
 
   @required_fields [:phone_number_id, :waba_id]
-  @optional_fields [:display_name, :access_token, :quality_rating, :daily_limit, 
-                    :is_warmup_active, :warmup_started_at, :system_prompt, :app_id,
-                    :mobile_number, :app_secret]
+  @optional_fields [
+    :display_name,
+    :access_token,
+    :quality_rating,
+    :daily_limit,
+    :is_warmup_active,
+    :warmup_started_at,
+    :system_prompt,
+    :app_id,
+    :mobile_number,
+    :app_secret,
+    :max_mps
+  ]
 
   def changeset(phone_number, attrs) do
     phone_number
     |> cast(attrs, @required_fields ++ @optional_fields)
     |> validate_required(@required_fields)
+    |> validate_number(:max_mps, greater_than_or_equal_to: 10, less_than_or_equal_to: 500)
     |> unique_constraint(:phone_number_id)
   end
 end

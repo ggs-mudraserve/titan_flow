@@ -8,8 +8,6 @@ defmodule TitanFlow.Repo.Migrations.AddDedupFieldsToCampaigns do
     end
 
     # Create composite index for fast deduplication queries
-    create index(:message_logs, [:inserted_at, :recipient_phone], 
-      name: :idx_message_logs_dedup
-    )
+    create index(:message_logs, [:inserted_at, :recipient_phone], name: :idx_message_logs_dedup)
   end
 end

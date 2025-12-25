@@ -18,7 +18,10 @@ defmodule TitanFlow.AI.Handler do
   Process an incoming message asynchronously.
   Checks AI pause, STOP keyword, then generates AI response.
   """
-  def process_message(%{message: message, conversation: conversation, phone_number_id: phone_number_id} = _params) do
+  def process_message(
+        %{message: message, conversation: conversation, phone_number_id: phone_number_id} =
+          _params
+      ) do
     Task.start(fn ->
       do_process_message(message, conversation, phone_number_id)
     end)
@@ -27,7 +30,7 @@ defmodule TitanFlow.AI.Handler do
   defp do_process_message(message, conversation, phone_number_id) do
     # Get phone number record
     phone_number = WhatsApp.get_by_phone_number_id(phone_number_id)
-    
+
     if is_nil(phone_number) do
       Logger.warning("Phone number not found for phone_number_id: #{phone_number_id}")
       :ok
@@ -39,7 +42,7 @@ defmodule TitanFlow.AI.Handler do
       else
         # Step 2: Check for STOP keyword
         content = String.downcase(message.content || "")
-        
+
         if String.contains?(content, "stop") do
           handle_stop_command(conversation, phone_number)
         else
@@ -54,7 +57,7 @@ defmodule TitanFlow.AI.Handler do
     # Update contact as blacklisted (if contacts table has is_blacklisted field)
     # For now, pause AI for this conversation
     Inbox.toggle_ai_pause(conversation.id)
-    
+
     # Send unsubscribe confirmation
     Client.send_text(
       phone_number.phone_number_id,
@@ -72,15 +75,17 @@ defmodule TitanFlow.AI.Handler do
     })
   end
 
-  defp generate_ai_response(message, conversation, phone_number) do
+  defp generate_ai_response(_message, conversation, phone_number) do
     # Fetch last 5 messages for context
     recent_messages = get_recent_messages(conversation.id, 5)
-    
+
     # Build conversation history for OpenAI
     messages = build_openai_messages(recent_messages, phone_number.system_prompt)
-    
+
     # Resolve API Key from Global Settings, fallback to env
-    api_key = TitanFlow.Settings.get_value("openai_api_key") || Application.get_env(:titan_flow, :openai_api_key)
+    api_key =
+      TitanFlow.Settings.get_value("openai_api_key") ||
+        Application.get_env(:titan_flow, :openai_api_key)
 
     # Call OpenAI API
     case call_openai(messages, api_key) do
@@ -94,12 +99,13 @@ defmodule TitanFlow.AI.Handler do
         )
 
         # Save AI response to database
-        {:ok, ai_message} = Inbox.create_message(%{
-          conversation_id: conversation.id,
-          direction: "outbound",
-          content: response_text,
-          is_ai_generated: true
-        })
+        {:ok, ai_message} =
+          Inbox.create_message(%{
+            conversation_id: conversation.id,
+            direction: "outbound",
+            content: response_text,
+            is_ai_generated: true
+          })
 
         # Broadcast for real-time UI update
         updated_conversation = Inbox.get_conversation!(conversation.id)
@@ -123,13 +129,15 @@ defmodule TitanFlow.AI.Handler do
   defp build_openai_messages(recent_messages, system_prompt) do
     system = %{
       "role" => "system",
-      "content" => system_prompt || "You are a helpful assistant. Keep answers short and friendly."
+      "content" =>
+        system_prompt || "You are a helpful assistant. Keep answers short and friendly."
     }
 
-    history = Enum.map(recent_messages, fn msg ->
-      role = if msg.direction == "inbound", do: "user", else: "assistant"
-      %{"role" => role, "content" => msg.content || ""}
-    end)
+    history =
+      Enum.map(recent_messages, fn msg ->
+        role = if msg.direction == "inbound", do: "user", else: "assistant"
+        %{"role" => role, "content" => msg.content || ""}
+      end)
 
     [system | history]
   end
@@ -146,13 +154,13 @@ defmodule TitanFlow.AI.Handler do
       }
 
       case Req.post(@openai_url,
-        json: body,
-        headers: [
-          {"Authorization", "Bearer #{api_key}"},
-          {"Content-Type", "application/json"}
-        ],
-        receive_timeout: 30_000
-      ) do
+             json: body,
+             headers: [
+               {"Authorization", "Bearer #{api_key}"},
+               {"Content-Type", "application/json"}
+             ],
+             receive_timeout: 30_000
+           ) do
         {:ok, %Req.Response{status: 200, body: response}} ->
           content = get_in(response, ["choices", Access.at(0), "message", "content"])
           {:ok, content}

@@ -8,32 +8,36 @@ defmodule TitanFlowWeb.CampaignLive.New do
   alias TitanFlow.Templates
   alias TitanFlow.WhatsApp
 
+  @default_mps 80
+
   @impl true
   def mount(_params, _session, socket) do
     templates = Templates.list_templates()
-    approved_templates = Enum.filter(templates, fn t -> 
-      t.status == "APPROVED" and t.category == "UTILITY" 
-    end)
     phone_numbers = WhatsApp.list_phone_numbers()
 
     socket =
       socket
       |> assign(current_path: "/campaigns")
       |> assign(page_title: "New Campaign")
-      |> assign(all_templates: templates)  # ALL templates for filtering
+      # ALL templates for filtering
+      |> assign(all_templates: templates)
       |> assign(phone_numbers: phone_numbers)
-      # New sender config: list of %{phone_id: nil, template_ids: MapSet.new(), expanded: true}
-      |> assign(senders_config: [%{id: generate_id(), phone_id: nil, template_ids: MapSet.new()}])
+      # New sender config: list of %{phone_id: nil, template_ids: [], expanded: true}
+      |> assign(
+        senders_config: [%{id: generate_id(), phone_id: nil, template_ids: [], mps: @default_mps}]
+      )
       |> assign(campaign_name: "")
       |> assign(dedup_window_days: 0)
       |> assign(saving: false)
       |> assign(error: nil)
       # Draft Mode state
       |> assign(draft_campaign: nil)
-      |> assign(import_status: "idle")  # idle | uploading | importing | ready | error
+      # idle | uploading | importing | ready | error
+      |> assign(import_status: "idle")
       |> assign(import_progress: 0)
       |> assign(import_count: 0)
-      |> assign(upload_processed: false)  # Guard against double processing
+      # Guard against double processing
+      |> assign(upload_processed: false)
       |> allow_upload(:csv_file,
         accept: ~w(.csv .gz .zip),
         max_entries: 1,
@@ -58,106 +62,79 @@ defmodule TitanFlowWeb.CampaignLive.New do
     end
   end
 
-  # Handle form validation - also detect completed uploads and Dedup changes
-  @impl true
-  def handle_event("validate", params, socket) do
-    campaign_params = params["campaign"] || %{}
-    # Preserve existing name if not provided in this validate event
-    name = case campaign_params["name"] do
-      nil -> socket.assigns.campaign_name
-      val -> val
-    end
-    
-    # Check if dedup window changed
-    new_dedup_val = parse_dedup_days(campaign_params["dedup_window_days"])
-    old_dedup_val = socket.assigns.dedup_window_days
-    dedup_changed = new_dedup_val != old_dedup_val
-    
-    # Handle phone selection from form params
-    # Form fields are named "phone-{sender_id}" and contain the phone_id value
-    socket = update_senders_from_params(socket, params)
-    
-    # Update socket with new values
-    socket = socket
-      |> assign(campaign_name: name)
-      |> assign(dedup_window_days: new_dedup_val)
-      |> assign(error: nil) # Clear error on validation
-    
-    # Check for completed uploads that haven't been processed yet
-    socket = maybe_process_completed_upload(socket)
-    
-    # TRIGGER RE-IMPORT if dedup changed and we already have a draft campaign
-    socket = 
-      if dedup_changed and socket.assigns.import_status == "ready" and socket.assigns.draft_campaign do
-        Logger.info("Draft Mode: Dedup window changed to #{new_dedup_val}, re-importing...")
-        
-        # Debounce the re-import slightly to avoid rapid-fire reloads while typing
-        # But for now, we'll just trigger it.
-        start_reimport(socket, socket.assigns.draft_campaign, new_dedup_val)
-      else
-        socket
-      end
-    
-    {:noreply, socket}
-  end
-
   # Extract phone selections from form params and update senders_config
   defp update_senders_from_params(socket, params) do
     Logger.debug("update_senders_from_params - all params keys: #{inspect(Map.keys(params))}")
-    
-    senders = Enum.map(socket.assigns.senders_config, fn sender ->
-      # Look for "phone-{sender.id}" in params
-      param_key = "phone-#{sender.id}"
-      param_value = params[param_key]
-      Logger.debug("Checking sender #{sender.id}: param_key=#{param_key}, value=#{inspect(param_value)}, current phone_id=#{inspect(sender.phone_id)}")
-      
-      case param_value do
-        nil -> 
-          sender
-        "" -> 
-          # Empty selection - reset phone_id
-          if sender.phone_id != nil do
-            Logger.info("Resetting phone_id to nil for sender #{sender.id}")
-            %{sender | phone_id: nil, template_ids: MapSet.new()}
-          else
-            sender
-          end
-        phone_id_str ->
-          new_phone_id = String.to_integer(phone_id_str)
-          if sender.phone_id != new_phone_id do
-            Logger.info("Updating phone_id from #{inspect(sender.phone_id)} to #{new_phone_id} for sender #{sender.id}")
-            # Phone changed - reset template selection
-            %{sender | phone_id: new_phone_id, template_ids: MapSet.new()}
-          else
-            sender
-          end
-      end
-    end)
-    
+
+    senders =
+      Enum.map(socket.assigns.senders_config, fn sender ->
+        # Look for "phone-{sender.id}" in params
+        param_key = "phone-#{sender.id}"
+        param_value = params[param_key]
+
+        Logger.debug(
+          "Checking sender #{sender.id}: param_key=#{param_key}, value=#{inspect(param_value)}, current phone_id=#{inspect(sender.phone_id)}"
+        )
+
+        mps_key = "mps-#{sender.id}"
+        new_mps = parse_mps(params[mps_key], sender.mps || @default_mps)
+
+        case param_value do
+          nil ->
+            %{sender | mps: new_mps}
+
+          "" ->
+            # Empty selection - reset phone_id
+            if sender.phone_id != nil do
+              Logger.info("Resetting phone_id to nil for sender #{sender.id}")
+              %{sender | phone_id: nil, template_ids: [], mps: new_mps}
+            else
+              %{sender | mps: new_mps}
+            end
+
+          phone_id_str ->
+            new_phone_id = String.to_integer(phone_id_str)
+
+            if sender.phone_id != new_phone_id do
+              Logger.info(
+                "Updating phone_id from #{inspect(sender.phone_id)} to #{new_phone_id} for sender #{sender.id}"
+              )
+
+              # Phone changed - reset template selection
+              %{sender | phone_id: new_phone_id, template_ids: [], mps: new_mps}
+            else
+              %{sender | mps: new_mps}
+            end
+        end
+      end)
+
     assign(socket, senders_config: senders)
   end
 
   defp start_reimport(socket, campaign, dedup_days) do
     # Update campaign with new dedup setting first
-    {:ok, updated_campaign} = Campaigns.update_campaign(campaign, %{dedup_window_days: dedup_days})
-    
+    {:ok, updated_campaign} =
+      Campaigns.update_campaign(campaign, %{dedup_window_days: dedup_days})
+
     parent = self()
-    
+
     Task.start(fn ->
       try do
         Logger.info("Draft Mode: clearing contacts for re-import")
         # 1. Clear existing contacts
         {deleted, _} = Repo.delete_all(from c in "contacts", where: c.campaign_id == ^campaign.id)
         Logger.info("Draft Mode: deleted #{deleted} old contacts")
-        
+
         # 2. Re-run import
         Logger.info("Draft Mode: restarting import with window #{dedup_days}")
         alias TitanFlow.Campaigns.Importer
-        {:ok, inserted_count} = Importer.import_csv(updated_campaign.csv_path, updated_campaign.id)
-        
+
+        {:ok, inserted_count} =
+          Importer.import_csv(updated_campaign.csv_path, updated_campaign.id)
+
         # 3. Reload stats
         final_campaign = Campaigns.get_campaign!(campaign.id)
-        
+
         send(parent, {:import_complete, final_campaign, inserted_count})
       rescue
         e ->
@@ -165,52 +142,39 @@ defmodule TitanFlowWeb.CampaignLive.New do
           send(parent, {:import_error, Exception.message(e)})
       end
     end)
-    
+
     # Set status back to importing
     assign(socket, import_status: "importing", draft_campaign: updated_campaign)
-  end
-
-  # Dedicated event handler for when file selection changes
-  @impl true
-  def handle_event("file-selected", _params, socket) do
-    # Update status to uploading when file is selected
-    socket = if Enum.any?(socket.assigns.uploads.csv_file.entries) do
-      assign(socket, import_status: "uploading", import_progress: 0, upload_processed: false)
-    else
-      socket
-    end
-    {:noreply, socket}
   end
 
   # Detect completed uploads and trigger import
   defp maybe_process_completed_upload(socket) do
     uploads = socket.assigns.uploads.csv_file
     entries = uploads.entries
-    
+
     # Find completed entries
     completed = Enum.filter(entries, fn entry -> entry.done? and not entry.cancelled? end)
-    
+
     cond do
       # Already processed or importing
       socket.assigns.upload_processed ->
         # Just update progress if still uploading
         update_upload_progress(socket, entries)
-        
+
       # Has completed uploads - process them
       Enum.any?(completed) ->
         Logger.info("Draft Mode: Upload complete, starting import")
         process_completed_upload(socket)
-        
+
       # Still uploading - update progress  
       Enum.any?(entries) ->
         update_upload_progress(socket, entries)
-        
+
       # No uploads
       true ->
         socket
     end
   end
-
 
   defp update_upload_progress(socket, entries) do
     case entries do
@@ -218,6 +182,7 @@ defmodule TitanFlowWeb.CampaignLive.New do
         # Show actual progress - if done, show 100%
         progress = if entry.done?, do: 100, else: entry.progress
         assign(socket, import_status: "uploading", import_progress: progress)
+
       [] ->
         socket
     end
@@ -225,10 +190,11 @@ defmodule TitanFlowWeb.CampaignLive.New do
 
   defp process_completed_upload(socket) do
     Logger.info("Draft Mode: Processing completed upload")
-    
+
     # Mark as processed to prevent double processing
-    socket = assign(socket, upload_processed: true, import_status: "importing", import_progress: 100)
-    
+    socket =
+      assign(socket, upload_processed: true, import_status: "importing", import_progress: 100)
+
     # Consume uploaded entries (MUST be done synchronously in event handler)
     uploaded_files =
       consume_uploaded_entries(socket, :csv_file, fn %{path: path}, entry ->
@@ -241,36 +207,42 @@ defmodule TitanFlowWeb.CampaignLive.New do
       end)
 
     csv_path = List.first(uploaded_files)
-    
+
     if csv_path do
       # Create draft campaign
-      campaign_name = if socket.assigns.campaign_name == "", do: "Draft Campaign", else: socket.assigns.campaign_name
-      
+      campaign_name =
+        if socket.assigns.campaign_name == "",
+          do: "Draft Campaign",
+          else: socket.assigns.campaign_name
+
       campaign_params = %{
         "name" => campaign_name,
         "csv_path" => csv_path,
         "status" => "draft",
         "dedup_window_days" => socket.assigns.dedup_window_days
       }
-      
+
       case Campaigns.create_campaign(campaign_params) do
         {:ok, campaign} ->
           Logger.info("Draft Mode: Created draft campaign #{campaign.id}")
-          
+
           # Start import in background task
           parent = self()
+
           Task.start(fn ->
             try do
               Logger.info("Draft Mode: Starting CSV import for campaign #{campaign.id}")
               alias TitanFlow.Campaigns.Importer
               {:ok, inserted_count} = Importer.import_csv(csv_path, campaign.id)
-              
+
               # Reload campaign to get skip stats (updated inside Importer)
               updated_campaign = Campaigns.get_campaign!(campaign.id)
               skipped_count = updated_campaign.skipped_count || 0
-              
-              Logger.info("Draft Mode: Import complete - #{inserted_count} inserted, #{skipped_count} duplicates skipped")
-              
+
+              Logger.info(
+                "Draft Mode: Import complete - #{inserted_count} inserted, #{skipped_count} duplicates skipped"
+              )
+
               send(parent, {:import_complete, updated_campaign, inserted_count})
             rescue
               e ->
@@ -279,54 +251,136 @@ defmodule TitanFlowWeb.CampaignLive.New do
                 send(parent, {:import_error, Exception.message(e)})
             end
           end)
-          
+
           assign(socket, draft_campaign: campaign, import_status: "importing")
-          
+
         {:error, changeset} ->
           Logger.error("Draft Mode: Failed to create campaign - #{inspect(changeset.errors)}")
-          assign(socket, import_status: "error", error: "Failed to create draft campaign", upload_processed: false)
+
+          assign(socket,
+            import_status: "error",
+            error: "Failed to create draft campaign",
+            upload_processed: false
+          )
       end
     else
       Logger.error("Draft Mode: No file path after consume")
-      assign(socket, import_status: "error", error: "Failed to process uploaded file", upload_processed: false)
+
+      assign(socket,
+        import_status: "error",
+        error: "Failed to process uploaded file",
+        upload_processed: false
+      )
     end
   end
 
   # Handle import completion from background task
-  @impl true  
+  @impl true
   def handle_info({:import_complete, campaign, count}, socket) do
     Logger.info("Draft Mode: Import complete - #{count} contacts ready")
-    socket = socket
+
+    socket =
+      socket
       |> assign(draft_campaign: campaign)
       |> assign(import_status: "ready")
       |> assign(import_count: count)
+
     {:noreply, socket}
   end
 
   @impl true
   def handle_info({:import_error, error_msg}, socket) do
     Logger.error("Draft Mode: Import error - #{error_msg}")
-    socket = socket
+
+    socket =
+      socket
       |> assign(import_status: "error")
       |> assign(error: "Import failed: #{error_msg}")
-      |> assign(upload_processed: false)  # Allow retry
+      # Allow retry
+      |> assign(upload_processed: false)
+
+    {:noreply, socket}
+  end
+
+  # Handle form validation - also detect completed uploads and Dedup changes
+  @impl true
+  def handle_event("validate", params, socket) do
+    campaign_params = params["campaign"] || %{}
+    # Preserve existing name if not provided in this validate event
+    name =
+      case campaign_params["name"] do
+        nil -> socket.assigns.campaign_name
+        val -> val
+      end
+
+    # Check if dedup window changed
+    new_dedup_val = parse_dedup_days(campaign_params["dedup_window_days"])
+    old_dedup_val = socket.assigns.dedup_window_days
+    dedup_changed = new_dedup_val != old_dedup_val
+
+    # Handle phone selection from form params
+    # Form fields are named "phone-{sender_id}" and contain the phone_id value
+    socket = update_senders_from_params(socket, params)
+
+    # Update socket with new values
+    socket =
+      socket
+      |> assign(campaign_name: name)
+      |> assign(dedup_window_days: new_dedup_val)
+      # Clear error on validation
+      |> assign(error: nil)
+
+    # Check for completed uploads that haven't been processed yet
+    socket = maybe_process_completed_upload(socket)
+
+    # TRIGGER RE-IMPORT if dedup changed and we already have a draft campaign
+    socket =
+      if dedup_changed and socket.assigns.import_status == "ready" and
+           socket.assigns.draft_campaign do
+        Logger.info("Draft Mode: Dedup window changed to #{new_dedup_val}, re-importing...")
+
+        # Debounce the re-import slightly to avoid rapid-fire reloads while typing
+        # But for now, we'll just trigger it.
+        start_reimport(socket, socket.assigns.draft_campaign, new_dedup_val)
+      else
+        socket
+      end
+
+    {:noreply, socket}
+  end
+
+  # Dedicated event handler for when file selection changes
+  @impl true
+  def handle_event("file-selected", _params, socket) do
+    # Update status to uploading when file is selected
+    socket =
+      if Enum.any?(socket.assigns.uploads.csv_file.entries) do
+        assign(socket, import_status: "uploading", import_progress: 0, upload_processed: false)
+      else
+        socket
+      end
+
     {:noreply, socket}
   end
 
   # Sender Config Event Handlers
-  
+
   @impl true
   def handle_event("add_sender", _params, socket) do
-    new_sender = %{id: generate_id(), phone_id: nil, template_ids: MapSet.new()}
+    new_sender = %{id: generate_id(), phone_id: nil, template_ids: [], mps: @default_mps}
     senders = socket.assigns.senders_config ++ [new_sender]
     {:noreply, assign(socket, senders_config: senders)}
   end
 
   @impl true
   def handle_event("remove_sender", %{"id" => sender_id}, socket) do
-    senders = Enum.reject(socket.assigns.senders_config, & &1.id == sender_id)
+    senders = Enum.reject(socket.assigns.senders_config, &(&1.id == sender_id))
     # Ensure at least one sender
-    senders = if senders == [], do: [%{id: generate_id(), phone_id: nil, template_ids: MapSet.new()}], else: senders
+    senders =
+      if senders == [],
+        do: [%{id: generate_id(), phone_id: nil, template_ids: [], mps: @default_mps}],
+        else: senders
+
     {:noreply, assign(socket, senders_config: senders)}
   end
 
@@ -335,64 +389,84 @@ defmodule TitanFlowWeb.CampaignLive.New do
     sender_id = params["sender-id"]
     phone_id_str = params["phone-id"]
     phone_id = if phone_id_str in [nil, ""], do: nil, else: String.to_integer(phone_id_str)
-    
-    senders = Enum.map(socket.assigns.senders_config, fn sender ->
-      if sender.id == sender_id do
-        # Reset template selection when phone changes
-        %{sender | phone_id: phone_id, template_ids: MapSet.new()}
-      else
-        sender
-      end
-    end)
-    
-    {:noreply, assign(socket, senders_config: senders)}
+
+    if phone_id && phone_selected_elsewhere?(socket.assigns.senders_config, sender_id, phone_id) do
+      {:noreply, assign(socket, error: "That phone is already assigned to another sender")}
+    else
+      senders =
+        Enum.map(socket.assigns.senders_config, fn sender ->
+          if sender.id == sender_id do
+            # Reset template selection when phone changes
+            %{sender | phone_id: phone_id, template_ids: []}
+          else
+            sender
+          end
+        end)
+
+      {:noreply, assign(socket, senders_config: senders, error: nil)}
+    end
   end
 
   @impl true
-  def handle_event("toggle_sender_template", %{"sender-id" => sender_id, "template-id" => template_id}, socket) do
+  def handle_event(
+        "toggle_sender_template",
+        %{"sender-id" => sender_id, "template-id" => template_id},
+        socket
+      ) do
     template_id = String.to_integer(template_id)
-    
-    senders = Enum.map(socket.assigns.senders_config, fn sender ->
-      if sender.id == sender_id do
-        new_templates = if MapSet.member?(sender.template_ids, template_id) do
-          MapSet.delete(sender.template_ids, template_id)
+
+    senders =
+      Enum.map(socket.assigns.senders_config, fn sender ->
+        if sender.id == sender_id do
+          new_templates =
+            if template_id in sender.template_ids do
+              List.delete(sender.template_ids, template_id)
+            else
+              sender.template_ids ++ [template_id]
+            end
+
+          %{sender | template_ids: new_templates}
         else
-          MapSet.put(sender.template_ids, template_id)
+          sender
         end
-        %{sender | template_ids: new_templates}
-      else
-        sender
-      end
-    end)
-    
+      end)
+
     {:noreply, assign(socket, senders_config: senders)}
   end
 
   # Legacy handlers (kept for backwards compatibility, now unused)
   @impl true
   def handle_event("toggle_template", %{"id" => _id}, socket), do: {:noreply, socket}
-  
+
   @impl true
   def handle_event("toggle_phone", %{"id" => _id}, socket), do: {:noreply, socket}
-
 
   @impl true
   def handle_event("save", params, socket) do
     campaign_params = params["campaign"] || %{}
     name = campaign_params["name"] || socket.assigns.campaign_name
+    socket = update_senders_from_params(socket, params)
     senders_config = socket.assigns.senders_config
-    
+
     # Validation
-    valid_senders = Enum.filter(senders_config, fn s -> 
-      s.phone_id != nil and MapSet.size(s.template_ids) > 0
-    end)
+    valid_senders =
+      Enum.filter(senders_config, fn s ->
+        s.phone_id != nil and length(s.template_ids) > 0
+      end)
+
+    duplicate_phones = duplicate_phone_ids(valid_senders)
 
     cond do
       String.trim(name) == "" ->
         {:noreply, assign(socket, error: "Campaign name is required")}
 
+      duplicate_phones != [] ->
+        {:noreply,
+         assign(socket, error: "Duplicate phone selected: #{Enum.join(duplicate_phones, ", ")}")}
+
       Enum.empty?(valid_senders) ->
-        {:noreply, assign(socket, error: "Please configure at least one sender with phone and templates")}
+        {:noreply,
+         assign(socket, error: "Please configure at least one sender with phone and templates")}
 
       socket.assigns.import_status != "ready" ->
         {:noreply, assign(socket, error: "Please wait for CSV import to complete")}
@@ -410,36 +484,42 @@ defmodule TitanFlowWeb.CampaignLive.New do
 
   defp do_start_draft_campaign(socket, name, senders_config) do
     alias TitanFlow.Campaigns.Orchestrator
-    
+
     draft_campaign = socket.assigns.draft_campaign
-    
+
     if draft_campaign do
-      # Convert senders_config to storable format (MapSet -> List)
-      storable_config = Enum.map(senders_config, fn s ->
-        %{"phone_id" => s.phone_id, "template_ids" => MapSet.to_list(s.template_ids)}
-      end)
-      
+      # Convert senders_config to storable format (already lists, just format)
+      storable_config =
+        Enum.map(senders_config, fn s ->
+          %{
+            "phone_id" => s.phone_id,
+            "template_ids" => Enum.sort(s.template_ids),
+            "mps" => s.mps || @default_mps
+          }
+        end)
+
       # Extract legacy fields for backwards compatibility
       phone_ids = Enum.map(senders_config, & &1.phone_id) |> Enum.uniq()
-      all_template_ids = Enum.flat_map(senders_config, & MapSet.to_list(&1.template_ids)) |> Enum.uniq()
+      all_template_ids = Enum.flat_map(senders_config, & &1.template_ids) |> Enum.uniq()
       [primary_template_id | fallback_ids] = all_template_ids
       fallback_template_id = List.first(fallback_ids)
-      
-      {:ok, campaign} = Campaigns.update_campaign(draft_campaign, %{
-        name: name,
-        senders_config: storable_config,
-        # Legacy fields (backwards compat)
-        primary_template_id: primary_template_id,
-        fallback_template_id: fallback_template_id,
-        phone_ids: phone_ids,
-        template_ids: all_template_ids
-      })
-      
+
+      {:ok, campaign} =
+        Campaigns.update_campaign(draft_campaign, %{
+          name: name,
+          senders_config: storable_config,
+          # Legacy fields (backwards compat)
+          primary_template_id: primary_template_id,
+          fallback_template_id: fallback_template_id,
+          phone_ids: phone_ids,
+          template_ids: all_template_ids
+        })
+
       # Start orchestration (CSV already imported)
       Task.start(fn ->
         Orchestrator.start_campaign(campaign, phone_ids, all_template_ids, nil)
       end)
-      
+
       {:noreply,
        socket
        |> put_flash(:info, "Campaign '#{name}' started!")
@@ -449,71 +529,16 @@ defmodule TitanFlowWeb.CampaignLive.New do
     end
   end
 
-  # Keep legacy function for backwards compatibility (no draft mode)
-  defp do_save_campaign(socket, name, template_ids, phone_ids) do
-    alias TitanFlow.Campaigns.Orchestrator
-    
-    # Handle file upload
-    uploaded_files =
-      consume_uploaded_entries(socket, :csv_file, fn %{path: path}, entry ->
-        dest = Path.join(System.tmp_dir!(), "campaign_#{entry.uuid}.csv")
-        File.cp!(path, dest)
-        {:ok, dest}
-      end)
-
-    csv_path = List.first(uploaded_files)
-
-    # Use first template as primary, rest as fallbacks
-    [primary_template_id | fallback_ids] = template_ids
-    fallback_template_id = List.first(fallback_ids)
-
-    campaign_params = %{
-      "name" => name,
-      "csv_path" => csv_path,
-      "status" => "pending",
-      "primary_template_id" => primary_template_id,
-      "fallback_template_id" => fallback_template_id,
-      "phone_ids" => phone_ids,
-      "template_ids" => template_ids,
-      "dedup_window_days" => socket.assigns.dedup_window_days
-    }
-
-    case Campaigns.create_campaign(campaign_params) do
-      {:ok, campaign} ->
-        # Start the full orchestration flow in background
-        Task.start(fn ->
-          Orchestrator.start_campaign(campaign, phone_ids, template_ids, csv_path)
-        end)
-
-        {:noreply,
-         socket
-         |> put_flash(:info, "Campaign '#{name}' started!")
-         |> push_navigate(to: ~p"/campaigns")}
-
-      {:error, changeset} ->
-        error_msg = format_changeset_errors(changeset)
-        {:noreply, assign(socket, error: "Failed to create campaign: #{error_msg}", saving: false)}
-    end
-  end
-
-  defp format_changeset_errors(changeset) do
-    Ecto.Changeset.traverse_errors(changeset, fn {msg, opts} ->
-      Enum.reduce(opts, msg, fn {key, value}, acc ->
-        String.replace(acc, "%{#{key}}", to_string(value))
-      end)
-    end)
-    |> Enum.map(fn {field, errors} -> "#{field}: #{Enum.join(errors, ", ")}" end)
-    |> Enum.join("; ")
-  end
-
   defp parse_dedup_days(nil), do: 0
   defp parse_dedup_days(""), do: 0
+
   defp parse_dedup_days(val) when is_binary(val) do
     case Integer.parse(val) do
       {n, _} when n >= 0 -> n
       _ -> 0
     end
   end
+
   defp parse_dedup_days(val) when is_integer(val), do: max(0, val)
 
   @impl true
@@ -707,6 +732,20 @@ defmodule TitanFlowWeb.CampaignLive.New do
                         </select>
                       </div>
                       
+                      <%!-- MPS Required --%>
+                      <div class="w-28">
+                        <label class="block text-xs text-zinc-500 mb-1">MPS Required</label>
+                        <input
+                          type="number"
+                          name={"mps-#{sender.id}"}
+                          value={sender.mps || @default_mps}
+                          min="10"
+                          max="500"
+                          phx-debounce="300"
+                          class="w-full h-9 px-2 rounded-md text-xs bg-zinc-900 border border-zinc-800 text-zinc-100 hover:border-zinc-700 focus:outline-none focus:ring-1 focus:ring-indigo-500/50"
+                        />
+                      </div>
+                      
                       <%!-- Remove Button --%>
                       <%= if length(@senders_config) > 1 do %>
                         <button
@@ -727,7 +766,7 @@ defmodule TitanFlowWeb.CampaignLive.New do
                     <%= if sender.phone_id do %>
                       <div class="mt-3">
                         <label class="block text-xs text-zinc-500 mb-2">
-                          Templates (<%= MapSet.size(sender.template_ids) %> selected)
+                          Templates (<%= length(sender.template_ids) %> selected)
                         </label>
                         <%= if available_templates == [] do %>
                           <div class="text-xs text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded p-2">
@@ -742,12 +781,12 @@ defmodule TitanFlowWeb.CampaignLive.New do
                                 phx-value-sender-id={sender.id}
                                 phx-value-template-id={template.id}
                                 class={"px-3 py-1.5 rounded-full text-xs font-medium border transition-colors " <>
-                                  if MapSet.member?(sender.template_ids, template.id),
+                                  if template.id in sender.template_ids,
                                     do: "bg-indigo-500/20 border-indigo-500/50 text-indigo-300",
                                     else: "bg-zinc-800 border-zinc-700 text-zinc-400 hover:border-zinc-600"}
                               >
                                 <%= template.name %>
-                                <%= if MapSet.member?(sender.template_ids, template.id) do %>
+                                <%= if template.id in sender.template_ids do %>
                                   <span class="ml-1">✓</span>
                                 <% end %>
                               </button>
@@ -807,25 +846,55 @@ defmodule TitanFlowWeb.CampaignLive.New do
     """
   end
 
-  defp quality_badge_class("GREEN"), do: "px-2 py-0.5 rounded text-xs font-medium bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-  defp quality_badge_class("YELLOW"), do: "px-2 py-0.5 rounded text-xs font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30"
-  defp quality_badge_class("RED"), do: "px-2 py-0.5 rounded text-xs font-medium bg-red-500/20 text-red-400 border border-red-500/30"
-  defp quality_badge_class(_), do: "px-2 py-0.5 rounded text-xs font-medium bg-zinc-700/50 text-zinc-400 border border-zinc-700"
+  defp parse_mps(nil, fallback), do: fallback
+  defp parse_mps("", fallback), do: fallback
+  defp parse_mps(val, _fallback) when is_integer(val), do: clamp_mps(val)
+
+  defp parse_mps(val, fallback) when is_binary(val) do
+    case Integer.parse(val) do
+      {n, _} -> clamp_mps(n)
+      :error -> fallback
+    end
+  end
+
+  defp clamp_mps(mps) when is_integer(mps) do
+    mps
+    |> max(10)
+    |> min(500)
+  end
+
+  defp phone_selected_elsewhere?(senders_config, sender_id, phone_id) do
+    Enum.any?(senders_config, fn sender ->
+      sender.id != sender_id and sender.phone_id == phone_id
+    end)
+  end
+
+  defp duplicate_phone_ids(senders_config) do
+    senders_config
+    |> Enum.map(& &1.phone_id)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.group_by(& &1)
+    |> Enum.filter(fn {_phone_id, list} -> length(list) > 1 end)
+    |> Enum.map(fn {phone_id, _} -> to_string(phone_id) end)
+  end
 
   defp error_to_string(:too_large), do: "File too large (max 100MB)"
   defp error_to_string(:not_accepted), do: "Only CSV files are accepted"
   defp error_to_string(:too_many_files), do: "Only one file allowed"
   defp error_to_string(err), do: "Upload error: #{inspect(err)}"
-  
+
   # Generate unique ID for sender config items
   defp generate_id, do: :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
-  
+
   # Filter templates by phone's phone_number_id (templates belong to specific phones)
   defp templates_for_phone(all_templates, phone_id, phone_numbers) do
-    phone = Enum.find(phone_numbers, & &1.id == phone_id)
+    phone = Enum.find(phone_numbers, &(&1.id == phone_id))
+
     if phone do
       Enum.filter(all_templates, fn t ->
-        t.phone_number_id == phone.id and t.status == "APPROVED"
+        t.phone_number_id == phone.id and
+          t.status == "APPROVED" and
+          t.category == "UTILITY"
       end)
     else
       []

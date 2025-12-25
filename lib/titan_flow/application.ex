@@ -28,14 +28,16 @@ defmodule TitanFlow.Application do
        name: :redix},
 
       # Hammer rate limiter backend
-      {Hammer.Backend.Redis, [
-        expiry_ms: 60_000 * 60 * 2,  # 2 hours
-        redix_config: [
-          host: redix_config[:host],
-          port: redix_config[:port],
-          password: redix_config[:password]
-        ]
-      ]},
+      {Hammer.Backend.Redis,
+       [
+         # 2 hours
+         expiry_ms: 60_000 * 60 * 2,
+         redix_config: [
+           host: redix_config[:host],
+           port: redix_config[:port],
+           password: redix_config[:password]
+         ]
+       ]},
 
       # Registry for WhatsApp rate limiters (one per phone_number_id)
       {Registry, keys: :unique, name: TitanFlow.WhatsApp.RateLimiterRegistry},
@@ -74,11 +76,23 @@ defmodule TitanFlow.Application do
       # Log Batcher for async message_logs and contact_history batch inserts (Formula 1 v2)
       TitanFlow.Campaigns.LogBatcher,
 
+      # P2 FIX: Webhook status update batcher (reduces DB writes by 100x)
+      TitanFlow.Campaigns.WebhookBatcher,
+
+      # P1 FIX: Debounced completion checker (every 30s instead of per webhook)
+      TitanFlow.Campaigns.CompletionChecker,
+
+      # Rehydrate running campaigns after restart
+      TitanFlow.Campaigns.CampaignRehydrator,
+
       # Metrics Reporter for periodic system health monitoring (Phase 1: 5A + 6A)
       TitanFlow.Campaigns.MetricsReporter,
 
+      # Pipeline Watchdog for stalled campaign recovery
+      TitanFlow.Campaigns.PipelineWatchdog,
+
       # AutoScaler for dynamic MPS adjustment based on queue depth and DB load (Phase 3: 7B + 7C)
-      TitanFlow.Campaigns.AutoScaler,
+      # TitanFlow.Campaigns.AutoScaler,  # DISABLED: uses KEYS scan
 
       # Campaign pipelines are started dynamically when a campaign begins:
       # TitanFlow.Campaigns.Pipeline.start_link(phone_number_id: "...", template_name: "...", ...)

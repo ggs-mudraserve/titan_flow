@@ -25,6 +25,7 @@ defmodule TitanFlowWeb.Router do
     pipe_through :browser
 
     live "/login", AuthLive.Login
+    post "/login", SessionController, :create
   end
 
   # Protected application routes
@@ -50,7 +51,7 @@ defmodule TitanFlowWeb.Router do
     # Primary webhook routes (with /whatsapp suffix)
     get "/webhooks/whatsapp", WebhookController, :verify
     post "/webhooks/whatsapp", WebhookController, :handle
-    
+
     # Alias routes (without /whatsapp suffix) - for Meta compatibility
     get "/webhooks", WebhookController, :verify
     post "/webhooks", WebhookController, :handle

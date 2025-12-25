@@ -25,8 +25,16 @@ defmodule TitanFlow.Inbox.Conversation do
 
   def changeset(conversation, attrs) do
     conversation
-    |> cast(attrs, [:contact_phone, :contact_name, :phone_number_id, :last_message_at, 
-                    :last_message_preview, :unread_count, :is_ai_paused, :status])
+    |> cast(attrs, [
+      :contact_phone,
+      :contact_name,
+      :phone_number_id,
+      :last_message_at,
+      :last_message_preview,
+      :unread_count,
+      :is_ai_paused,
+      :status
+    ])
     |> validate_required([:contact_phone])
   end
 end

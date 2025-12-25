@@ -8,7 +8,8 @@ defmodule TitanFlow.Inbox.Message do
   alias TitanFlow.Inbox.Conversation
 
   schema "messages" do
-    field :direction, :string  # "inbound" or "outbound"
+    # "inbound" or "outbound"
+    field :direction, :string
     field :content, :string
     field :message_type, :string, default: "text"
     field :meta_message_id, :string
@@ -23,8 +24,16 @@ defmodule TitanFlow.Inbox.Message do
 
   def changeset(message, attrs) do
     message
-    |> cast(attrs, [:conversation_id, :direction, :content, :message_type, 
-                    :meta_message_id, :status, :template_name, :is_ai_generated])
+    |> cast(attrs, [
+      :conversation_id,
+      :direction,
+      :content,
+      :message_type,
+      :meta_message_id,
+      :status,
+      :template_name,
+      :is_ai_generated
+    ])
     |> validate_required([:conversation_id, :direction])
     |> validate_inclusion(:direction, ["inbound", "outbound"])
   end

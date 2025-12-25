@@ -14,6 +14,7 @@ WorkingDirectory=/root/titan_flow
 # Environment
 Environment=MIX_ENV=prod
 Environment=PHX_SERVER=true
+Environment=ERL_EPMD_ADDRESS=127.0.0.1
 Environment=LANG=en_US.UTF-8
 EnvironmentFile=/root/titan_flow/.env.production
 

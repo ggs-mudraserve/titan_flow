@@ -28,8 +28,7 @@ config :titan_flow, TitanFlowWeb.Endpoint,
 # PostgreSQL Database Configuration (all environments)
 # Using Supavisor connection pooler (port 6543) - REQUIRED for production
 # Direct connection (port 5432/5433) will cause "too_many_connections" errors
-# FORCED to Supavisor
-db_port = String.to_integer(System.get_env("DATABASE_PORT") || "6543")
+db_port = String.to_integer(System.get_env("DATABASE_PORT") || "6543")  # FORCED to Supavisor
 
 # Warn if using direct PostgreSQL port in production
 if config_env() == :prod and db_port in [5432, 5433] do
@@ -46,21 +45,14 @@ config :titan_flow, TitanFlow.Repo,
   password: System.get_env("DATABASE_PASSWORD") || "dWupoUeRBRJcr_7NGOIw_RLleVpd8c5AySgWV10Zp9Q",
   hostname: System.get_env("DATABASE_HOST") || "85.17.142.45",
   port: db_port,
-  # Your actual database name
-  database: System.get_env("DATABASE_NAME") || "titan_flow",
+  database: System.get_env("DATABASE_NAME") || "titan_flow",  # Your actual database name
   # Supavisor Transaction Mode settings (critical for connection pooler)
-  # Required for Supavisor transaction mode - don't use named prepared statements
-  prepare: :unnamed,
-  # Increased to 30 to support 20 workers + Web
-  pool_size: String.to_integer(System.get_env("POOL_SIZE") || "30"),
-  # Allow requests to queue for up to 5 seconds
-  queue_target: 5000,
-  # Check queue every second
-  queue_interval: 1000,
-  # Query timeout: 15 seconds (default is 15000)
-  timeout: 15000,
-  # How long to wait to get a connection from pool
-  checkout_timeout: 15000,
+  prepare: :unnamed,  # Required for Supavisor transaction mode - don't use named prepared statements
+  pool_size: String.to_integer(System.get_env("POOL_SIZE") || "30"),  # Increased to 30 to support 20 workers + Web
+  queue_target: 5000,  # Allow requests to queue for up to 5 seconds
+  queue_interval: 1000,  # Check queue every second
+  timeout: 15000,  # Query timeout: 15 seconds (default is 15000)
+  checkout_timeout: 15000,  # How long to wait to get a connection from pool
   socket_options: socket_opts
 
 # Redis Configuration (Redix)
@@ -73,30 +65,40 @@ config :titan_flow, :redix,
 
 # Hammer Rate Limiter with Redis Backend
 config :hammer,
-  backend:
-    {Hammer.Backend.Redis,
-     [
-       # Keep buckets for 2 hours
-       expiry_ms: 60_000 * 60 * 2,
-       redix_config: [
-         host: "85.17.142.45",
-         port: 6379,
-         password: "J4Rlz_-uxl8FTFdoKn9sYksG628c8EFZUVJNuoHFQRU"
-       ]
-     ]}
+  backend: {Hammer.Backend.Redis, [
+    expiry_ms: 60_000 * 60 * 2, # Keep buckets for 2 hours
+    redix_config: [
+      host: "85.17.142.45",
+      port: 6379,
+      password: "J4Rlz_-uxl8FTFdoKn9sYksG628c8EFZUVJNuoHFQRU"
+    ]
+  ]}
 
 # OpenAI Configuration
 config :titan_flow, :openai_api_key, System.get_env("OPENAI_API_KEY")
 
 # Webhook Verification Token
-config :titan_flow,
-       :webhook_verify_token,
-       System.get_env("WEBHOOK_VERIFY_TOKEN", "titanflow_webhook_secret")
+config :titan_flow, :webhook_verify_token, System.get_env("WEBHOOK_VERIFY_TOKEN", "titanflow_webhook_secret")
 
 # Admin PIN for dashboard access
 config :titan_flow, :admin_pin, System.get_env("ADMIN_PIN", "766100")
 
+# HTTP Client Connection Pool for High-Speed Sending
+# 10 phones × 50 MPS × 300ms avg latency = ~150 concurrent connections
+# Setting to 500 for safety margin during high-volume campaigns
+config :tesla, adapter: {Tesla.Adapter.Hackney, 
+  recv_timeout: 30_000,           # 30 second timeout for slow Meta API responses
+  pool: :default,                 # Use default Hackney pool
+  max_connections: 500            # Support 500 MPS (10 phones × 50 MPS)
+}
+
+
 if config_env() == :prod do
+  maybe_ipv6 = if System.get_env("ECTO_IPV6") in ~w(true 1), do: [:inet6], else: []
+
+  # config :titan_flow, TitanFlow.Repo,
+  #   socket_options: maybe_ipv6
+
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
   # want to use a different value for prod and you most likely don't want
@@ -116,9 +118,11 @@ if config_env() == :prod do
   config :titan_flow, TitanFlowWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [
-      # Bind to localhost; nginx handles public TLS traffic.
-      # See https://hexdocs.pm/bandit/Bandit.html#t:options/0 for details.
-      ip: {127, 0, 0, 1}
+      # Enable IPv6 and bind on all interfaces.
+      # Set it to  {0, 0, 0, 0, 0, 0, 0, 1} for local network only access.
+      # See the documentation on https://hexdocs.pm/bandit/Bandit.html#t:options/0
+      # for details about using IPv6 vs IPv4 and loopback vs public addresses.
+      ip: {0, 0, 0, 0, 0, 0, 0, 0}
     ],
     secret_key_base: secret_key_base
 
