@@ -1,6 +1,7 @@
 defmodule TitanFlowWeb.NumberLive.FormComponent do
   use TitanFlowWeb, :live_component
 
+  alias TitanFlow.Faqs
   alias TitanFlow.WhatsApp
 
   @impl true
@@ -124,6 +125,21 @@ defmodule TitanFlowWeb.NumberLive.FormComponent do
             ><%= @form[:system_prompt].value %></textarea>
             <p class="mt-1 text-xs text-gray-500">This prompt defines the AI personality for this phone number.</p>
           </div>
+
+          <!-- FAQ Routing -->
+          <div class="pt-4 border-t border-gray-700">
+            <label class="block text-sm font-medium text-gray-300 mb-2">
+              📚 FAQ Set
+            </label>
+            <.select
+              name={@form[:faq_set_id].name}
+              value={@form[:faq_set_id].value}
+              options={faq_set_options(@faq_sets)}
+            />
+            <p class="mt-1 text-xs text-gray-500">
+              Assign this number to a specific FAQ set for auto-replies.
+            </p>
+          </div>
         </div>
 
         <div class="flex items-center justify-end gap-3 pt-6">
@@ -148,10 +164,12 @@ defmodule TitanFlowWeb.NumberLive.FormComponent do
   @impl true
   def update(%{phone_number: phone_number} = assigns, socket) do
     changeset = WhatsApp.change_phone_number(phone_number)
+    faq_sets = Faqs.list_faq_sets()
 
     {:ok,
      socket
      |> assign(assigns)
+     |> assign(:faq_sets, faq_sets)
      |> assign_form(changeset)}
   end
 
@@ -205,4 +223,8 @@ defmodule TitanFlowWeb.NumberLive.FormComponent do
   end
 
   defp notify_parent(msg), do: send(self(), {__MODULE__, msg})
+
+  defp faq_set_options(faq_sets) do
+    [{"None", ""}] ++ Enum.map(faq_sets, fn set -> {set.name, set.id} end)
+  end
 end

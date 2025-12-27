@@ -698,6 +698,135 @@ defmodule TitanFlow.Campaigns.Orchestrator do
     end
   end
 
+  @doc """
+  Redistribute retry load when a phone is exhausted.
+  Rebuilds weights using remaining phones and restarts their BufferManagers in retry mode.
+  """
+  def redistribute_retry_for_campaign(campaign_id) do
+    retry_mode =
+      case Redix.command(:redix, ["GET", "campaign:#{campaign_id}:retry_mode"]) do
+        {:ok, "1"} -> true
+        _ -> false
+      end
+
+    if not retry_mode do
+      :ignore
+    else
+      campaign = Campaigns.get_campaign!(campaign_id)
+
+      exhausted_numbers =
+        case Redix.command(:redix, ["SMEMBERS", "campaign:#{campaign_id}:exhausted_phones"]) do
+          {:ok, list} -> MapSet.new(list)
+          _ -> MapSet.new()
+        end
+
+      {valid_phone_ids, approved_templates_by_phone} =
+        (campaign.senders_config || [])
+        |> Enum.reduce({[], %{}}, fn config, {ids_acc, map_acc} ->
+          phone_id = config["phone_id"]
+          template_ids = config["template_ids"] || []
+
+          phone =
+            try do
+              WhatsApp.get_phone_number!(phone_id)
+            rescue
+              _ -> nil
+            end
+
+          is_exhausted =
+            case phone do
+              nil -> true
+              phone -> MapSet.member?(exhausted_numbers, phone.phone_number_id)
+            end
+
+          if is_exhausted do
+            {ids_acc, map_acc}
+          else
+            approved_templates =
+              Enum.filter(template_ids, fn tid ->
+                try do
+                  template = TitanFlow.Templates.get_template!(tid)
+                  template.status == "APPROVED"
+                rescue
+                  _ -> false
+                end
+              end)
+
+            if length(approved_templates) > 0 do
+              {[phone_id | ids_acc], Map.put(map_acc, phone_id, approved_templates)}
+            else
+              {ids_acc, map_acc}
+            end
+          end
+        end)
+
+      valid_phone_ids = Enum.reverse(valid_phone_ids)
+
+      if length(valid_phone_ids) == 0 do
+        Logger.warning(
+          "Retry redistribution skipped for campaign #{campaign_id}: no eligible phones remain"
+        )
+
+        :ok
+      else
+        phones = Enum.map(valid_phone_ids, &WhatsApp.get_phone_number!/1)
+        phone_template_map = approved_templates_by_phone
+        phone_mps_map = build_phone_mps_map(campaign, valid_phone_ids)
+        weighted_map = build_weighted_phone_map(phones, phone_mps_map)
+
+        for phone <- phones do
+          weighted_indices = Map.get(weighted_map.phone_indices, phone.phone_number_id, [0])
+          total_slots = weighted_map.total_slots
+
+          stop_buffer_manager_for_phone(campaign.id, phone.phone_number_id)
+
+          DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
+            TitanFlow.Campaigns.BufferManager,
+            campaign_id: campaign.id,
+            phone_number_id: phone.phone_number_id,
+            weighted_indices: weighted_indices,
+            total_slots: total_slots,
+            retry_mode: true
+          })
+
+          case Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone.phone_number_id) do
+            [] ->
+              phone_template_ids = Map.get(phone_template_map, phone.id, [])
+
+              pipeline_spec = %{
+                id: {:pipeline, phone.phone_number_id},
+                start:
+                  {Pipeline, :start_link,
+                   [
+                     [
+                       phone_number_id: phone.phone_number_id,
+                       campaign_id: campaign.id,
+                       template_ids: phone_template_ids
+                     ]
+                   ]},
+                restart: :permanent
+              }
+
+              DynamicSupervisor.start_child(TitanFlow.Campaigns.PipelineSupervisor, pipeline_spec)
+
+            _ ->
+              :ok
+          end
+        end
+
+        for exhausted_phone_number_id <- MapSet.to_list(exhausted_numbers) do
+          stop_buffer_manager_for_phone(campaign.id, exhausted_phone_number_id)
+        end
+
+        Logger.info(
+          "Retry redistribution complete for campaign #{campaign_id} (active phones: #{length(valid_phone_ids)})"
+        )
+
+        :ok
+      end
+    end
+  end
+
   defp build_phone_template_map(campaign, phone_ids, template_ids) do
     # Try to use senders_config (new format)
     if campaign.senders_config && length(campaign.senders_config) > 0 do

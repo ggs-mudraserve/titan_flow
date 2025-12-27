@@ -42,6 +42,7 @@ defmodule TitanFlowWeb.Router do
     live "/numbers/new", NumberLive.Index, :new
     live "/numbers/:id/edit", NumberLive.Index, :edit
     live "/templates", TemplateLive.Index
+    live "/faqs", FaqLive.Index
     live "/settings", SettingsLive
   end
 

@@ -21,6 +21,13 @@ defmodule TitanFlow.Campaigns.Pipeline do
 
   @retry_delay_ms 100
   @max_retries 5
+  @spam_error_window_ms 120_000
+  @spam_error_threshold 10
+  @spam_pause_ms 300_000
+  @spam_pause_ttl_ms 600_000
+  @spam_resume_mps 20
+  @exhausted_drain_batch_size 500
+  @exhausted_drain_ttl_ms 86_400_000
 
   @doc """
   Start a Broadway pipeline for a specific phone number's queue.
@@ -252,6 +259,74 @@ defmodule TitanFlow.Campaigns.Pipeline do
     Redix.command(:redix, ["RPUSH", queue_name, data])
   end
 
+  defp maybe_handle_spam_rate_limit(campaign_id, phone_number_id) do
+    now_ms = System.system_time(:millisecond)
+    window_key = "campaign:#{campaign_id}:phone:#{phone_number_id}:131048_window"
+    pause_key = "campaign:#{campaign_id}:phone:#{phone_number_id}:131048_pause_until"
+
+    pause_until =
+      case Redix.command(:redix, ["GET", pause_key]) do
+        {:ok, nil} -> nil
+        {:ok, val} -> String.to_integer(val)
+        _ -> nil
+      end
+
+    if pause_until && now_ms >= pause_until do
+      require Logger
+
+      Logger.error(
+        "Campaign #{campaign_id} phone #{phone_number_id}: 131048 persisted after pause, exhausting phone"
+      )
+
+      mark_phone_exhausted(campaign_id, phone_number_id)
+      _ = Redix.command(:redix, ["DEL", pause_key])
+    end
+
+    member = "#{now_ms}:#{System.unique_integer([:positive])}"
+
+    count =
+      case Redix.pipeline(:redix, [
+             ["ZADD", window_key, now_ms, member],
+             ["ZREMRANGEBYSCORE", window_key, 0, now_ms - @spam_error_window_ms],
+             ["EXPIRE", window_key, 600],
+             ["ZCARD", window_key]
+           ]) do
+        {:ok, [_added, _trimmed, _expire, card]} -> card
+        _ -> 0
+      end
+
+    if count > @spam_error_threshold do
+      new_pause_until = now_ms + @spam_pause_ms
+
+      case Redix.command(:redix, [
+             "SET",
+             pause_key,
+             new_pause_until,
+             "PX",
+             @spam_pause_ttl_ms,
+             "NX"
+           ]) do
+        {:ok, "OK"} ->
+          require Logger
+
+          Logger.warning(
+            "Campaign #{campaign_id} phone #{phone_number_id}: 131048 threshold hit (#{count}/2m), pausing 5m and resuming at #{@spam_resume_mps} MPS"
+          )
+
+          _ =
+            RateLimiter.pause_for(
+              phone_number_id,
+              :rate_limited_131048_threshold,
+              @spam_pause_ms,
+              @spam_resume_mps
+            )
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
   # Private Functions
 
   # Get templates that haven't failed for this phone in this campaign
@@ -295,6 +370,8 @@ defmodule TitanFlow.Campaigns.Pipeline do
   defp mark_phone_exhausted(campaign_id, phone_number_id) do
     # Mark phone as exhausted in Redis
     Redix.command(:redix, ["SADD", "campaign:#{campaign_id}:exhausted_phones", phone_number_id])
+    maybe_drain_exhausted_queue(campaign_id, phone_number_id)
+    Task.start(fn -> Orchestrator.redistribute_retry_for_campaign(campaign_id) end)
 
     # Check if ALL phones are now exhausted
     {:ok, exhausted_phones} =
@@ -302,7 +379,13 @@ defmodule TitanFlow.Campaigns.Pipeline do
 
     # Get campaign to check total phone count
     campaign = TitanFlow.Campaigns.get_campaign!(campaign_id)
-    total_phones = length(campaign.phone_ids || [])
+
+    total_phones =
+      case campaign.senders_config do
+        nil -> length(campaign.phone_ids || [])
+        config when is_list(config) -> length(Enum.map(config, fn c -> c["phone_id"] end))
+        _ -> length(campaign.phone_ids || [])
+      end
 
     if length(exhausted_phones) >= total_phones do
       # All phones exhausted - pause campaign with message
@@ -314,6 +397,73 @@ defmodule TitanFlow.Campaigns.Pipeline do
       TitanFlow.Campaigns.update_campaign(campaign, %{
         error_message: "All numbers exhausted"
       })
+    end
+  end
+
+  defp maybe_drain_exhausted_queue(campaign_id, phone_number_id) do
+    drain_key = "campaign:#{campaign_id}:phone:#{phone_number_id}:exhausted_drained"
+
+    case Redix.command(:redix, ["SET", drain_key, "1", "PX", @exhausted_drain_ttl_ms, "NX"]) do
+      {:ok, "OK"} ->
+        Task.start(fn -> drain_queue_as_failed(campaign_id, phone_number_id) end)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp drain_queue_as_failed(campaign_id, phone_number_id) do
+    queue_name = "queue:sending:#{campaign_id}:#{phone_number_id}"
+
+    case Redix.command(:redix, ["LPOP", queue_name, @exhausted_drain_batch_size]) do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, []} ->
+        :ok
+
+      {:ok, raw_items} when is_list(raw_items) ->
+        Enum.each(raw_items, fn item ->
+          case Jason.decode(item) do
+            {:ok, payload} ->
+              MessageTracking.record_failed(
+                campaign_id,
+                payload["contact_id"],
+                payload["phone"],
+                "N/A",
+                "PHONE_EXHAUSTED",
+                "Phone exhausted - queue drained",
+                phone_number_id
+              )
+
+            _ ->
+              :ok
+          end
+        end)
+
+        drain_queue_as_failed(campaign_id, phone_number_id)
+
+      {:ok, item} when is_binary(item) ->
+        case Jason.decode(item) do
+          {:ok, payload} ->
+            MessageTracking.record_failed(
+              campaign_id,
+              payload["contact_id"],
+              payload["phone"],
+              "N/A",
+              "PHONE_EXHAUSTED",
+              "Phone exhausted - queue drained",
+              phone_number_id
+            )
+
+          _ ->
+            :ok
+        end
+
+        drain_queue_as_failed(campaign_id, phone_number_id)
+
+      _ ->
+        :ok
     end
   end
 
@@ -566,6 +716,7 @@ defmodule TitanFlow.Campaigns.Pipeline do
             if to_string(error_code) == "131048" do
               # Spam rate limit - pause this phone for 60s, then resume
               RateLimiter.notify_spam_rate_limited(phone_number_id)
+              maybe_handle_spam_rate_limit(campaign_id, phone_number_id)
 
               Task.start(fn ->
                 MessageTracking.record_failed(

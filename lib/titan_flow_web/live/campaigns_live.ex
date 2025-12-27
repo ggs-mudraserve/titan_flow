@@ -193,6 +193,7 @@ defmodule TitanFlowWeb.CampaignsLive do
         mps={@current_mps}
         retrying={MapSet.member?(@retrying_campaigns, @selected_campaign.id)}
         webhook_queue_depth={@webhook_queue_depth}
+        phone_statuses={@phone_statuses}
       />
     <% end %>
     """
@@ -205,6 +206,7 @@ defmodule TitanFlowWeb.CampaignsLive do
     campaign = Campaigns.get_campaign!(id)
     queue_depth = Campaigns.webhook_queue_depth()
     running_campaigns? = Campaigns.running_campaigns?()
+    phone_statuses = Campaigns.phone_statuses(campaign.id)
     # Start polling if running
     if connected?(socket), do: Process.send_after(self(), :tick, 2000)
 
@@ -236,6 +238,7 @@ defmodule TitanFlowWeb.CampaignsLive do
        template_stats: template_stats,
        failed_messages: failed_messages,
        current_mps: 0.0,
+       phone_statuses: phone_statuses,
        webhook_queue_depth: queue_depth,
        running_campaigns?: running_campaigns?
      )}
@@ -380,6 +383,7 @@ defmodule TitanFlowWeb.CampaignsLive do
       campaign = Campaigns.get_campaign!(campaign_id)
 
       new_stats = TitanFlow.Campaigns.MessageTracking.get_realtime_stats(campaign_id)
+      phone_statuses = Campaigns.phone_statuses(campaign_id)
 
       # Only fetch template_stats once when campaign completes (not on every tick)
       template_stats =
@@ -401,7 +405,8 @@ defmodule TitanFlowWeb.CampaignsLive do
          selected_campaign: campaign,
          live_stats: new_stats,
          template_stats: template_stats,
-         current_mps: mps
+         current_mps: mps,
+         phone_statuses: phone_statuses
          # failed_messages intentionally NOT updated - stays from initial load
        )}
     else
@@ -534,6 +539,14 @@ defmodule TitanFlowWeb.CampaignsLive do
     TitanFlowWeb.DateTimeHelpers.format_datetime(datetime)
   end
 
+  defp format_ms_timestamp(nil), do: "-"
+
+  defp format_ms_timestamp(ms) do
+    ms
+    |> DateTime.from_unix!(:millisecond)
+    |> TitanFlowWeb.DateTimeHelpers.format_datetime_with_seconds()
+  end
+
   defp progress_percent(campaign) do
     total = campaign.total_records || 0
     processed = (campaign.sent_count || 0) + (campaign.failed_count || 0)
@@ -589,6 +602,13 @@ defmodule TitanFlowWeb.CampaignsLive do
 
     alias TitanFlowWeb.DateTimeHelpers
 
+    phone_statuses = assigns[:phone_statuses] || []
+
+    active_phone_statuses =
+      Enum.filter(phone_statuses, fn status ->
+        status.exhausted or status.paused_until_ms
+      end)
+
     campaign_started_at =
       if assigns.campaign.started_at,
         do: DateTimeHelpers.format_datetime_with_seconds(assigns.campaign.started_at),
@@ -614,6 +634,7 @@ defmodule TitanFlowWeb.CampaignsLive do
       |> assign(:started_at, campaign_started_at)
       |> assign(:completed_at, campaign_completed_at)
       |> assign(:webhook_queue_warn, queue_warn)
+      |> assign(:active_phone_statuses, active_phone_statuses)
 
     ~H"""
     <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" phx-click="close_stats">
@@ -682,6 +703,30 @@ defmodule TitanFlowWeb.CampaignsLive do
                     Final contact list: <span class="font-mono font-medium"><%= @campaign.total_records %></span> contacts
                   </div>
                 </div>
+              </div>
+            </div>
+          <% end %>
+
+          <%= if Enum.any?(@active_phone_statuses) do %>
+            <div class="bg-zinc-800/50 rounded-lg p-4 border border-zinc-800">
+              <div class="text-sm font-medium text-zinc-300">Phone Status</div>
+              <div class="mt-2 space-y-2">
+                <%= for status <- @active_phone_statuses do %>
+                  <div class="flex items-center justify-between text-xs">
+                    <div class="text-zinc-300">
+                      <%= status.display_name || status.phone_number_id %>
+                      <span class="text-zinc-500">(<%= status.phone_number_id %>)</span>
+                    </div>
+                    <div class="text-right">
+                      <%= if status.exhausted do %>
+                        <span class="text-red-400 font-medium">Exhausted</span>
+                      <% else %>
+                        <span class="text-amber-400 font-medium">Paused (131048 threshold)</span>
+                        <span class="text-zinc-500 ml-1">until <%= format_ms_timestamp(status.paused_until_ms) %></span>
+                      <% end %>
+                    </div>
+                  </div>
+                <% end %>
               </div>
             </div>
           <% end %>

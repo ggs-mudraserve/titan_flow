@@ -6,10 +6,12 @@ defmodule TitanFlowWeb.SettingsLive do
   @impl true
   def mount(_params, _session, socket) do
     api_key = Settings.get_value("openai_api_key", "")
+    faq_enabled = Settings.get_value("faq_enabled", "true")
 
     {:ok,
      assign(socket,
        api_key: api_key,
+       faq_enabled: faq_enabled,
        current_path: "/settings",
        saved: false
      )}
@@ -29,15 +31,28 @@ defmodule TitanFlowWeb.SettingsLive do
             <label class="block text-sm font-medium text-zinc-300 mb-2">
               OpenAI API Key
             </label>
-            <input 
-              type="password" 
-              name="openai_api_key" 
-              value={@api_key} 
-              placeholder="sk-..." 
-              class="w-full h-9 px-3 rounded-md text-sm bg-zinc-900 border border-zinc-800 text-zinc-100 placeholder-zinc-500 hover:border-zinc-700 focus:outline-none focus:ring-1 focus:ring-indigo-500/50 focus:border-indigo-500"
+            <.input
+              type="password"
+              name="openai_api_key"
+              value={@api_key}
+              placeholder="sk-..."
             />
             <p class="mt-2 text-xs text-zinc-500">
               This key will be used for AI auto-replies across all phone numbers.
+            </p>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-zinc-300 mb-2">
+              FAQ Auto-Replies
+            </label>
+            <.select
+              name="faq_enabled"
+              options={[{"Enabled", "true"}, {"Disabled", "false"}]}
+              value={@faq_enabled}
+            />
+            <p class="mt-2 text-xs text-zinc-500">
+              Disable to force all replies through the current AI flow.
             </p>
           </div>
 
@@ -62,12 +77,16 @@ defmodule TitanFlowWeb.SettingsLive do
   end
 
   @impl true
-  def handle_event("save", %{"openai_api_key" => key}, socket) do
+  def handle_event("save", %{"openai_api_key" => key} = params, socket) do
+    faq_enabled = Map.get(params, "faq_enabled", "false")
+
     Settings.set_value("openai_api_key", key)
+    Settings.set_value("faq_enabled", faq_enabled)
 
     {:noreply,
      assign(socket,
        api_key: key,
+       faq_enabled: faq_enabled,
        saved: true
      )}
   end

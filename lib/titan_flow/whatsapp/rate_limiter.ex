@@ -82,6 +82,27 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
   end
 
   @doc """
+  Pause a phone for a custom duration and resume at a specific MPS.
+  """
+  def pause_for(phone_number_id, reason, duration_ms, resume_mps) do
+    case Registry.lookup(TitanFlow.WhatsApp.RateLimiterRegistry, phone_number_id) do
+      [] ->
+        case start_on_demand(phone_number_id) do
+          {:ok, _pid} ->
+            GenServer.cast(via_tuple(phone_number_id), {:pause_for, reason, duration_ms, resume_mps})
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      _ ->
+        GenServer.cast(via_tuple(phone_number_id), {:pause_for, reason, duration_ms, resume_mps})
+        :ok
+    end
+  end
+
+  @doc """
   Get current rate limiter state for monitoring.
   """
   def get_state(phone_number_id) do
@@ -225,6 +246,17 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
     )
 
     {:noreply, pause(state, :rate_limited_131048, @spam_pause_duration_ms, state.configured_mps)}
+  end
+
+  @impl true
+  def handle_cast({:pause_for, reason, duration_ms, resume_mps}, state) do
+    clamped_mps = clamp(resume_mps, @min_mps, @max_mps)
+
+    Logger.warning(
+      "RateLimiter #{state.phone_number_id}: Paused for #{duration_ms}ms (#{inspect(reason)})"
+    )
+
+    {:noreply, pause(state, reason, duration_ms, clamped_mps)}
   end
 
   @impl true

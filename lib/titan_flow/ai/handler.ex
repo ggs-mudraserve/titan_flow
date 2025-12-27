@@ -4,6 +4,7 @@ defmodule TitanFlow.AI.Handler do
   """
 
   require Logger
+  alias TitanFlow.Faqs
   alias TitanFlow.WhatsApp
   alias TitanFlow.WhatsApp.Client
   alias TitanFlow.Inbox
@@ -46,8 +47,18 @@ defmodule TitanFlow.AI.Handler do
         if String.contains?(content, "stop") do
           handle_stop_command(conversation, phone_number)
         else
-          # Step 3: Generate and send AI response
-          generate_ai_response(message, conversation, phone_number)
+          case maybe_send_faq_response(message, conversation, phone_number) do
+            :sent ->
+              :ok
+
+            :no_match ->
+              # Step 3: Generate and send AI response
+              generate_ai_response(message, conversation, phone_number)
+
+            {:error, reason} ->
+              Logger.warning("FAQ match failed: #{inspect(reason)}")
+              generate_ai_response(message, conversation, phone_number)
+          end
         end
       end
     end
@@ -113,6 +124,41 @@ defmodule TitanFlow.AI.Handler do
 
       {:error, reason} ->
         Logger.error("OpenAI API error: #{inspect(reason)}")
+    end
+  end
+
+  defp maybe_send_faq_response(message, conversation, phone_number) do
+    if is_nil(phone_number.faq_set_id) do
+      :no_match
+    else
+      case Faqs.match_question(phone_number.faq_set_id, message.content) do
+        {:ok, answer} ->
+          Client.send_text(
+            phone_number.phone_number_id,
+            conversation.contact_phone,
+            answer.answer_text,
+            phone_number.access_token
+          )
+
+          {:ok, faq_message} =
+            Inbox.create_message(%{
+              conversation_id: conversation.id,
+              direction: "outbound",
+              content: answer.answer_text,
+              is_ai_generated: false
+            })
+
+          updated_conversation = Inbox.get_conversation!(conversation.id)
+          Inbox.broadcast_new_message(faq_message, updated_conversation)
+
+          :sent
+
+        :no_match ->
+          :no_match
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 

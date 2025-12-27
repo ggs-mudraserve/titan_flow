@@ -6,6 +6,7 @@ defmodule TitanFlow.Campaigns do
   import Ecto.Query
   alias TitanFlow.Repo
   alias TitanFlow.Campaigns.Campaign
+  alias TitanFlow.WhatsApp
 
   @doc """
   Creates a new campaign.
@@ -138,6 +139,76 @@ defmodule TitanFlow.Campaigns do
       _ -> false
     catch
       :exit, _ -> false
+    end
+  end
+
+  @doc """
+  Returns per-phone pause/exhausted status for a campaign.
+  """
+  def phone_statuses(campaign_id) do
+    try do
+      campaign = get_campaign!(campaign_id)
+
+      phone_ids =
+        case campaign.senders_config do
+          nil -> campaign.phone_ids || []
+          config when is_list(config) -> Enum.map(config, fn c -> c["phone_id"] end)
+          _ -> campaign.phone_ids || []
+        end
+
+      Enum.reduce(phone_ids, [], fn phone_id, acc ->
+        phone =
+          try do
+            WhatsApp.get_phone_number!(phone_id)
+          rescue
+            _ -> nil
+          end
+
+        if phone do
+          pause_key =
+            "campaign:#{campaign_id}:phone:#{phone.phone_number_id}:131048_pause_until"
+
+          paused_until =
+            case Redix.command(:redix, ["GET", pause_key]) do
+              {:ok, nil} -> nil
+              {:ok, val} -> String.to_integer(val)
+              _ -> nil
+            end
+
+          paused_until =
+            if paused_until && paused_until > System.system_time(:millisecond),
+              do: paused_until,
+              else: nil
+
+          exhausted =
+            case Redix.command(:redix, [
+                   "SISMEMBER",
+                   "campaign:#{campaign_id}:exhausted_phones",
+                   phone.phone_number_id
+                 ]) do
+              {:ok, 1} -> true
+              _ -> false
+            end
+
+          [
+            %{
+              phone_id: phone.id,
+              phone_number_id: phone.phone_number_id,
+              display_name: phone.display_name,
+              paused_until_ms: paused_until,
+              exhausted: exhausted
+            }
+            | acc
+          ]
+        else
+          acc
+        end
+      end)
+      |> Enum.reverse()
+    rescue
+      _ -> []
+    catch
+      :exit, _ -> []
     end
   end
 

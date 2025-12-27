@@ -5,6 +5,8 @@ defmodule TitanFlow.WhatsApp.PhoneNumber do
   use Ecto.Schema
   import Ecto.Changeset
 
+  alias TitanFlow.Faqs.FaqSet
+
   schema "phone_numbers" do
     field :waba_id, :string
     field :phone_number_id, :string
@@ -21,6 +23,8 @@ defmodule TitanFlow.WhatsApp.PhoneNumber do
     # Messages Per Second limit (10-500)
     field :max_mps, :integer, default: 80
 
+    belongs_to :faq_set, FaqSet
+
     timestamps()
   end
 
@@ -36,7 +40,8 @@ defmodule TitanFlow.WhatsApp.PhoneNumber do
     :app_id,
     :mobile_number,
     :app_secret,
-    :max_mps
+    :max_mps,
+    :faq_set_id
   ]
 
   def changeset(phone_number, attrs) do
