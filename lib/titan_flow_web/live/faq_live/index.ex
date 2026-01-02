@@ -61,7 +61,11 @@ defmodule TitanFlowWeb.FaqLive.Index do
   end
 
   @impl true
-  def handle_event("add_question", %{"answer_id" => answer_id, "question_text" => question_text}, socket) do
+  def handle_event(
+        "add_question",
+        %{"answer_id" => answer_id, "question_text" => question_text},
+        socket
+      ) do
     answer_id = parse_id(answer_id)
 
     cond do
@@ -148,7 +152,11 @@ defmodule TitanFlowWeb.FaqLive.Index do
   end
 
   @impl true
-  def handle_event("save_question", %{"question_id" => id, "question_text" => question_text}, socket) do
+  def handle_event(
+        "save_question",
+        %{"question_id" => id, "question_text" => question_text},
+        socket
+      ) do
     question = id |> parse_id() |> Faqs.get_question!()
 
     case Faqs.update_question(question, %{question_text: question_text}) do

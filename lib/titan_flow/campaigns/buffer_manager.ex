@@ -77,6 +77,7 @@ defmodule TitanFlow.Campaigns.BufferManager do
       total_pushed: 0,
       # True when no more contacts to push
       is_exhausted: false,
+      assignment_mode: Keyword.get(opts, :assignment_mode, false),
       # Weighted distribution: multiple indices for higher MPS phones
       weighted_indices: Keyword.get(opts, :weighted_indices, [0]),
       total_slots: Keyword.get(opts, :total_slots, 1),
@@ -161,14 +162,23 @@ defmodule TitanFlow.Campaigns.BufferManager do
           fetch_retry_contacts(state, fetch_count)
         else
           contacts =
-            fetch_unsent_contacts(
-              state.campaign_id,
-              state.last_contact_id,
-              fetch_count,
-              state.weighted_indices,
-              state.total_slots,
-              state.retry_mode
-            )
+            if state.assignment_mode do
+              fetch_assigned_contacts(
+                state.campaign_id,
+                state.phone_number_id,
+                state.last_contact_id,
+                fetch_count
+              )
+            else
+              fetch_unsent_contacts(
+                state.campaign_id,
+                state.last_contact_id,
+                fetch_count,
+                state.weighted_indices,
+                state.total_slots,
+                state.retry_mode
+              )
+            end
 
           {contacts, state}
         end
@@ -177,6 +187,10 @@ defmodule TitanFlow.Campaigns.BufferManager do
         Logger.info(
           "BufferManager: No more contacts for campaign #{state.campaign_id}, marking exhausted"
         )
+
+        Task.start(fn ->
+          TitanFlow.Campaigns.Orchestrator.maybe_redistribute_on_exhaustion(state.campaign_id)
+        end)
 
         # Trigger completion check asynchronously (don't block BufferManager)
         Task.start(fn ->
@@ -189,6 +203,7 @@ defmodule TitanFlow.Campaigns.BufferManager do
       else
         # Push to Redis
         pushed = push_to_redis(contacts, state.phone_number_id, state.campaign_id)
+
         if state.retry_mode do
           Logger.info(
             "BufferManager: Pushed #{pushed} contacts (retry) failed_cursor=#{state.last_failed_id} nolog_cursor=#{state.last_nolog_id}"
@@ -227,6 +242,31 @@ defmodule TitanFlow.Campaigns.BufferManager do
         where: is_nil(m.id),
         # WEIGHTED MODULO: Contact assigned to this phone if rem(id, total) IN indices
         where: fragment("? % ? = ANY(?)", c.id, ^total_slots, ^weighted_indices),
+        order_by: [asc: c.id],
+        limit: ^limit,
+        select: %{
+          id: c.id,
+          phone: c.phone,
+          name: c.name,
+          variables: c.variables
+        }
+
+    Repo.all(query)
+  end
+
+  defp fetch_assigned_contacts(campaign_id, phone_number_id, after_id, limit) do
+    query =
+      from c in "contacts",
+        join: a in "contact_assignments",
+        on:
+          a.contact_id == c.id and a.campaign_id == ^campaign_id and
+            a.phone_number_id == ^phone_number_id,
+        left_join: m in "message_logs",
+        on: m.contact_id == c.id and m.campaign_id == c.campaign_id,
+        where: c.campaign_id == ^campaign_id,
+        where: c.id > ^after_id,
+        where: c.is_blacklisted == false,
+        where: is_nil(m.id),
         order_by: [asc: c.id],
         limit: ^limit,
         select: %{

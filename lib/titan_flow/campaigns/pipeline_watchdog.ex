@@ -63,15 +63,19 @@ defmodule TitanFlow.Campaigns.PipelineWatchdog do
         Map.get(state.campaigns, campaign.id, %{
           last_sent: sent_count,
           last_progress_at: now_ms,
-          last_restart_at: nil
+          last_restart_at: nil,
+          last_missing_restart_at: nil
         })
+
+      missing_with_queue = missing_pipelines_with_queue(campaign)
 
       cond do
         sent_count > prev.last_sent ->
           put_campaign_state(state, campaign.id, %{
             last_sent: sent_count,
             last_progress_at: now_ms,
-            last_restart_at: prev.last_restart_at
+            last_restart_at: prev.last_restart_at,
+            last_missing_restart_at: prev.last_missing_restart_at
           })
 
         queue_depth > 0 and stall_timeout?(prev, now_ms) and restart_allowed?(prev, now_ms) ->
@@ -84,7 +88,22 @@ defmodule TitanFlow.Campaigns.PipelineWatchdog do
           put_campaign_state(state, campaign.id, %{
             last_sent: sent_count,
             last_progress_at: now_ms,
-            last_restart_at: now_ms
+            last_restart_at: now_ms,
+            last_missing_restart_at: prev.last_missing_restart_at
+          })
+
+        missing_with_queue != [] and missing_restart_allowed?(prev, now_ms) ->
+          Logger.warning(
+            "PipelineWatchdog: Campaign #{campaign.id} missing pipelines for #{inspect(missing_with_queue)} with queued messages; restarting"
+          )
+
+          Task.start(fn -> Orchestrator.ensure_pipelines_running(campaign.id) end)
+
+          put_campaign_state(state, campaign.id, %{
+            last_sent: sent_count,
+            last_progress_at: prev.last_progress_at,
+            last_restart_at: prev.last_restart_at,
+            last_missing_restart_at: now_ms
           })
 
         true ->
@@ -106,6 +125,22 @@ defmodule TitanFlow.Campaigns.PipelineWatchdog do
       nil -> true
       last_restart_at -> now_ms - last_restart_at >= @restart_cooldown_ms
     end
+  end
+
+  defp missing_restart_allowed?(prev, now_ms) do
+    case prev.last_missing_restart_at do
+      nil -> true
+      last_restart_at -> now_ms - last_restart_at >= @restart_cooldown_ms
+    end
+  end
+
+  defp missing_pipelines_with_queue(campaign) do
+    campaign
+    |> campaign_phone_number_ids()
+    |> Enum.filter(fn phone_number_id ->
+      queue_depth_for_phone(campaign.id, phone_number_id) > 0 and
+        Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone_number_id) == []
+    end)
   end
 
   defp queue_depth(campaign) do

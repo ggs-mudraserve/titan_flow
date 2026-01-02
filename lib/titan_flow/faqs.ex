@@ -171,7 +171,13 @@ defmodule TitanFlow.Faqs do
       from q in FaqQuestion,
         join: a in assoc(q, :answer),
         where: q.faq_set_id == ^faq_set_id and q.active == true and a.active == true,
-        where: fragment("similarity(?, ?) > ?", q.normalized_question, ^normalized, ^@similarity_threshold),
+        where:
+          fragment(
+            "similarity(?, ?) > ?",
+            q.normalized_question,
+            ^normalized,
+            ^@similarity_threshold
+          ),
         order_by: [desc: fragment("similarity(?, ?)", q.normalized_question, ^normalized)],
         limit: 1,
         select: a

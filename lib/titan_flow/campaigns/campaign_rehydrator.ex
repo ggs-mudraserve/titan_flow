@@ -49,9 +49,7 @@ defmodule TitanFlow.Campaigns.CampaignRehydrator do
         :ok
 
       campaigns ->
-        Logger.info(
-          "CampaignRehydrator: Rehydrating #{length(campaigns)} running campaign(s)"
-        )
+        Logger.info("CampaignRehydrator: Rehydrating #{length(campaigns)} running campaign(s)")
 
         Enum.each(campaigns, fn campaign ->
           case Orchestrator.resume_campaign(campaign.id) do

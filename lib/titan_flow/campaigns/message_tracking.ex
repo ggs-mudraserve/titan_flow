@@ -589,27 +589,27 @@ defmodule TitanFlow.Campaigns.MessageTracking do
             if retry_mode and not retry_buffer_started?(campaign.id, phone.phone_number_id) do
               false
             else
-            # Check BufferManager status
-            case TitanFlow.Campaigns.BufferManager.status(campaign.id, phone.phone_number_id) do
-              {:ok, %{is_exhausted: true}} ->
-                # BufferManager says exhausted, verify queue is empty
-                queue_empty?(campaign.id, phone.phone_number_id)
-
-              {:error, :not_running} ->
-                if retry_mode do
-                  # In retry mode, don't treat not_running as exhausted to avoid
-                  # premature completion before retry buffers start or stabilize.
-                  false
-                else
-                  # BufferManager not running - only exhausted if queue is also empty
-                  # This prevents premature completion when BM crashes but queue has messages
+              # Check BufferManager status
+              case TitanFlow.Campaigns.BufferManager.status(campaign.id, phone.phone_number_id) do
+                {:ok, %{is_exhausted: true}} ->
+                  # BufferManager says exhausted, verify queue is empty
                   queue_empty?(campaign.id, phone.phone_number_id)
-                end
 
-              # Still running and not exhausted
-              _ ->
-                false
-            end
+                {:error, :not_running} ->
+                  if retry_mode do
+                    # In retry mode, don't treat not_running as exhausted to avoid
+                    # premature completion before retry buffers start or stabilize.
+                    false
+                  else
+                    # BufferManager not running - only exhausted if queue is also empty
+                    # This prevents premature completion when BM crashes but queue has messages
+                    queue_empty?(campaign.id, phone.phone_number_id)
+                  end
+
+                # Still running and not exhausted
+                _ ->
+                  false
+              end
             end
         end
       end)
@@ -764,6 +764,11 @@ defmodule TitanFlow.Campaigns.MessageTracking do
         recipient_phone,
         template_name
       ) do
+    if error_code && phone_number_id && to_string(error_code) == "131048" do
+      TitanFlow.WhatsApp.RateLimiter.notify_spam_rate_limited(phone_number_id)
+      TitanFlow.Campaigns.Pipeline.handle_spam_rate_limit(campaign_id, phone_number_id)
+    end
+
     handle_error_triggers(
       campaign_id,
       phone_number_id,
@@ -978,17 +983,53 @@ defmodule TitanFlow.Campaigns.MessageTracking do
   Returns list of maps with: recipient_phone, error_code, error_message, sent_at
   """
   def get_failed_messages(campaign_id, limit \\ 100) do
-    from(m in MessageLog,
-      where: m.campaign_id == ^campaign_id and m.status == "failed",
-      order_by: [desc: m.sent_at],
+    latest_status_query = latest_recipient_status_query(campaign_id)
+
+    from(s in subquery(latest_status_query),
+      where: s.status == "failed",
+      order_by: [desc: s.sent_at],
       limit: ^limit,
       select: %{
+        recipient_phone: s.recipient_phone,
+        error_code: s.error_code,
+        error_message: s.error_message,
+        sent_at: s.sent_at
+      }
+    )
+    |> Repo.all()
+  end
+
+  @doc """
+  Returns a breakdown of failed messages by error code and message.
+  """
+  def get_failed_breakdown(campaign_id, limit \\ 50) do
+    latest_status_query = latest_recipient_status_query(campaign_id)
+
+    from(s in subquery(latest_status_query),
+      where: s.status == "failed",
+      group_by: [s.error_code, s.error_message],
+      select: %{
+        error_code: s.error_code,
+        error_message: s.error_message,
+        count: count(s.recipient_phone)
+      },
+      order_by: [desc: count(s.recipient_phone)],
+      limit: ^limit
+    )
+    |> Repo.all()
+  end
+
+  defp latest_recipient_status_query(campaign_id) do
+    from m in MessageLog,
+      where: m.campaign_id == ^campaign_id,
+      distinct: m.recipient_phone,
+      order_by: [desc: m.recipient_phone, desc: m.sent_at],
+      select: %{
         recipient_phone: m.recipient_phone,
+        status: m.status,
         error_code: m.error_code,
         error_message: m.error_message,
         sent_at: m.sent_at
       }
-    )
-    |> Repo.all()
   end
 end

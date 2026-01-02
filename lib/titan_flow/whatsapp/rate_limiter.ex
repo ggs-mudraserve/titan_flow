@@ -89,7 +89,11 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
       [] ->
         case start_on_demand(phone_number_id) do
           {:ok, _pid} ->
-            GenServer.cast(via_tuple(phone_number_id), {:pause_for, reason, duration_ms, resume_mps})
+            GenServer.cast(
+              via_tuple(phone_number_id),
+              {:pause_for, reason, duration_ms, resume_mps}
+            )
+
             :ok
 
           {:error, reason} ->
@@ -158,9 +162,7 @@ defmodule TitanFlow.WhatsApp.RateLimiter do
       GenServer.call(via_tuple(phone_number_id), :check_rate, 5_000)
     catch
       :exit, reason ->
-        Logger.error(
-          "RateLimiter: check_rate failed for #{phone_number_id}: #{inspect(reason)}"
-        )
+        Logger.error("RateLimiter: check_rate failed for #{phone_number_id}: #{inspect(reason)}")
 
         {:error, {:rate_limiter_down, reason}}
     end

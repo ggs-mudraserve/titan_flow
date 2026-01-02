@@ -1,11 +1,11 @@
 defmodule TitanFlowWeb.CampaignLive.Resume do
   @moduledoc """
-  Resume a draft campaign - uses same Sender Configuration UI as New Campaign (minus CSV upload).
+  Resume a paused/draft campaign using the same Sender Configuration UI as New Campaign (minus CSV upload).
 
   Edge cases handled:
-  - Draft not found: Redirect with error
-  - Draft has 0 contacts: Show error message
-  - Draft already started: Redirect to campaigns list
+  - Campaign not found: Redirect with error
+  - Campaign has 0 contacts: Show error message
+  - Campaign already running/completed: Redirect to campaigns list
   - Draft deleted while viewing: Handle gracefully
   """
 
@@ -28,18 +28,27 @@ defmodule TitanFlowWeb.CampaignLive.Resume do
          |> push_navigate(to: ~p"/campaigns")}
 
       campaign ->
-        if campaign.status != "draft" do
+        if campaign.status not in ["draft", "paused", "error"] do
           {:ok,
            socket
-           |> put_flash(:error, "Campaign is not a draft - cannot resume")
+           |> put_flash(:error, "Campaign cannot be resumed from its current state")
            |> push_navigate(to: ~p"/campaigns")}
         else
           # Touch updated_at to prevent cleanup while user is on page
           Campaigns.update_campaign(campaign, %{})
 
-          # Get available templates and phones
-          templates = Templates.list_templates()
+          # Get phones, refresh templates from Meta, then fetch fresh templates
           phone_numbers = WhatsApp.list_phone_numbers()
+
+          Enum.each(phone_numbers, fn phone ->
+            try do
+              WhatsApp.sync_templates(phone.id)
+            rescue
+              _ -> :ok
+            end
+          end)
+
+          templates = Templates.list_templates()
 
           # Initialize senders_config - either from existing campaign.senders_config or build from legacy fields
           senders_config = build_senders_config(campaign, phone_numbers)
@@ -237,6 +246,7 @@ defmodule TitanFlowWeb.CampaignLive.Resume do
     alias TitanFlow.Campaigns.Orchestrator
 
     campaign = socket.assigns.campaign
+    previous_phone_ids = campaign.phone_ids || []
 
     # Convert senders_config to storable format (already lists, just format)
     storable_config =
@@ -263,14 +273,16 @@ defmodule TitanFlowWeb.CampaignLive.Resume do
         fallback_template_id: fallback_template_id,
         phone_ids: phone_ids,
         template_ids: all_template_ids,
-        dedup_window_days: socket.assigns.dedup_window_days
+        dedup_window_days: socket.assigns.dedup_window_days,
+        error_message: nil,
+        completed_at: nil
       })
 
-    # Start orchestration (CSV already imported, just start BufferManagers and Pipelines)
-    Logger.info("Resume: Starting campaign #{campaign.id} from draft")
+    # Start orchestration (CSV already imported, restart with fresh runtime state)
+    Logger.info("Resume: Restarting campaign #{campaign.id}")
 
     Task.start(fn ->
-      Orchestrator.start_campaign(updated_campaign, phone_ids, all_template_ids, nil)
+      Orchestrator.restart_campaign(updated_campaign, phone_ids, all_template_ids, previous_phone_ids)
     end)
 
     {:noreply,
@@ -550,7 +562,7 @@ defmodule TitanFlowWeb.CampaignLive.Resume do
 
     if phone do
       Enum.filter(all_templates, fn t ->
-        t.phone_number_id == phone.id and t.status == "APPROVED"
+        t.phone_number_id == phone.id and t.status == "APPROVED" and t.category == "UTILITY"
       end)
     else
       []

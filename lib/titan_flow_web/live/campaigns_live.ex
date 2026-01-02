@@ -25,12 +25,12 @@ defmodule TitanFlowWeb.CampaignsLive do
        campaigns: page_data.entries,
        page: page_data.page,
        total_pages: page_data.total_pages,
-        total: page_data.total,
-        selected_campaign: nil,
-        retrying_campaigns: MapSet.new(),
-        webhook_queue_depth: queue_depth,
-        running_campaigns?: running_campaigns?,
-        webhook_queue_warn_threshold: @webhook_queue_warn_threshold
+       total: page_data.total,
+       selected_campaign: nil,
+       retrying_campaigns: MapSet.new(),
+       webhook_queue_depth: queue_depth,
+       running_campaigns?: running_campaigns?,
+       webhook_queue_warn_threshold: @webhook_queue_warn_threshold
      )}
   end
 
@@ -189,7 +189,7 @@ defmodule TitanFlowWeb.CampaignsLive do
         campaign={@selected_campaign}
         stats={@live_stats}
         template_stats={@template_stats}
-        failed_messages={@failed_messages}
+        failed_breakdown={@failed_breakdown}
         mps={@current_mps}
         retrying={MapSet.member?(@retrying_campaigns, @selected_campaign.id)}
         webhook_queue_depth={@webhook_queue_depth}
@@ -210,38 +210,50 @@ defmodule TitanFlowWeb.CampaignsLive do
     # Start polling if running
     if connected?(socket), do: Process.send_after(self(), :tick, 2000)
 
-    initial_stats = TitanFlow.Campaigns.MessageTracking.get_realtime_stats(campaign.id)
+    cached_stats = %{
+      sent_count: campaign.sent_count || 0,
+      delivered_count: campaign.delivered_count || 0,
+      read_count: campaign.read_count || 0,
+      replied_count: campaign.replied_count || 0,
+      failed_count: campaign.failed_count || 0
+    }
 
-    # SYNC FIX: Update campaign DB record with realtime stats on popup open
-    # This ensures page shows updated stats on refresh
-    Campaigns.update_campaign(campaign, %{
-      sent_count: initial_stats.sent_count,
-      delivered_count: initial_stats.delivered_count,
-      read_count: initial_stats.read_count,
-      failed_count: initial_stats.failed_count
-    })
-
-    template_stats =
-      if campaign.status == "completed" do
-        TitanFlow.Campaigns.MessageTracking.get_template_breakdown(campaign.id)
-      else
-        nil
-      end
-
-    # Fetch failed messages with error details
-    failed_messages = TitanFlow.Campaigns.MessageTracking.get_failed_messages(campaign.id, 50)
+    load_campaign_stats_async(campaign.id)
 
     {:noreply,
      assign(socket,
        selected_campaign: campaign,
-       live_stats: initial_stats,
-       template_stats: template_stats,
-       failed_messages: failed_messages,
-       current_mps: 0.0,
-       phone_statuses: phone_statuses,
-       webhook_queue_depth: queue_depth,
-       running_campaigns?: running_campaigns?
-     )}
+       live_stats: cached_stats,
+       template_stats: nil,
+       template_stats_updated_at: campaign.updated_at,
+       failed_breakdown: [],
+       failed_breakdown_updated_at: campaign.updated_at,
+        current_mps: 0.0,
+        phone_statuses: phone_statuses,
+        webhook_queue_depth: queue_depth,
+        running_campaigns?: running_campaigns?
+      )}
+  end
+
+  @impl true
+  def handle_info(
+        {:campaign_stats_loaded, campaign_id, campaign, stats, template_stats, failed_breakdown},
+        socket
+      ) do
+    if socket.assigns.selected_campaign &&
+         socket.assigns.selected_campaign.id == campaign_id do
+      {:noreply,
+       assign(socket,
+         selected_campaign: campaign,
+         live_stats: stats,
+         template_stats: template_stats,
+         template_stats_updated_at: campaign.updated_at,
+         failed_breakdown: failed_breakdown,
+         failed_breakdown_updated_at: campaign.updated_at
+       )}
+    else
+      {:noreply, socket}
+    end
   end
 
   @impl true
@@ -270,21 +282,7 @@ defmodule TitanFlowWeb.CampaignsLive do
 
   @impl true
   def handle_event("resume_campaign", %{"id" => id}, socket) do
-    alias TitanFlow.Campaigns.Orchestrator
-
-    case Orchestrator.resume_campaign(String.to_integer(id)) do
-      {:ok, _} ->
-        page_data = Campaigns.list_campaigns(socket.assigns.page, @per_page)
-        campaign = Campaigns.get_campaign!(id)
-
-        {:noreply,
-         socket
-         |> assign(campaigns: page_data.entries, selected_campaign: campaign)
-         |> put_flash(:info, "Campaign resumed")}
-
-      {:error, _} ->
-        {:noreply, put_flash(socket, :error, "Failed to resume campaign")}
-    end
+    {:noreply, push_navigate(socket, to: ~p"/campaigns/#{id}/resume")}
   end
 
   @impl true
@@ -385,12 +383,18 @@ defmodule TitanFlowWeb.CampaignsLive do
       new_stats = TitanFlow.Campaigns.MessageTracking.get_realtime_stats(campaign_id)
       phone_statuses = Campaigns.phone_statuses(campaign_id)
 
-      # Only fetch template_stats once when campaign completes (not on every tick)
-      template_stats =
-        if campaign.status == "completed" and socket.assigns[:template_stats] == nil do
-          TitanFlow.Campaigns.MessageTracking.get_template_breakdown(campaign.id)
+      {template_stats, template_stats_updated_at} =
+        if campaign.status == "completed" and
+             socket.assigns[:template_stats_updated_at] != campaign.updated_at do
+          {
+            TitanFlow.Campaigns.MessageTracking.get_template_breakdown(campaign.id),
+            campaign.updated_at
+          }
         else
-          socket.assigns[:template_stats]
+          {
+            socket.assigns[:template_stats],
+            socket.assigns[:template_stats_updated_at]
+          }
         end
 
       # Calculate MPS based on 10 second interval
@@ -398,16 +402,39 @@ defmodule TitanFlowWeb.CampaignsLive do
       new_sent = new_stats.sent_count || 0
       mps = max(0.0, (new_sent - old_sent) / 10.0)
 
-      # MEMORY OPTIMIZATION: Don't reload failed_messages on every tick
-      # Keep the initial list that was loaded when modal opened
+      current_failed_count = new_stats.failed_count || 0
+      previous_failed_count = socket.assigns.live_stats.failed_count || 0
+      failed_count_changed = current_failed_count != previous_failed_count
+
+      {failed_breakdown, failed_breakdown_updated_at} =
+        cond do
+          current_failed_count == 0 ->
+            {[], campaign.updated_at}
+
+          failed_count_changed or
+              socket.assigns[:failed_breakdown_updated_at] != campaign.updated_at ->
+            {
+              TitanFlow.Campaigns.MessageTracking.get_failed_breakdown(campaign.id),
+              campaign.updated_at
+            }
+
+          true ->
+            {
+              socket.assigns[:failed_breakdown] || [],
+              socket.assigns[:failed_breakdown_updated_at]
+            }
+        end
+
       {:noreply,
        assign(socket,
          selected_campaign: campaign,
          live_stats: new_stats,
          template_stats: template_stats,
+         template_stats_updated_at: template_stats_updated_at,
          current_mps: mps,
-         phone_statuses: phone_statuses
-         # failed_messages intentionally NOT updated - stays from initial load
+         phone_statuses: phone_statuses,
+         failed_breakdown: failed_breakdown,
+         failed_breakdown_updated_at: failed_breakdown_updated_at
        )}
     else
       {:noreply, socket}
@@ -507,6 +534,56 @@ defmodule TitanFlowWeb.CampaignsLive do
       "error" -> "#{base} bg-red-500/20 text-red-400 border border-red-500/30"
       _ -> "#{base} bg-zinc-700/50 text-zinc-400 border border-zinc-700"
     end
+  end
+
+  defp load_campaign_stats_async(campaign_id) do
+    caller = self()
+
+    Task.start(fn ->
+      require Logger
+
+      try do
+        campaign = Campaigns.get_campaign!(campaign_id)
+        stats = TitanFlow.Campaigns.MessageTracking.get_realtime_stats(campaign_id)
+
+        updated_campaign =
+          case Campaigns.update_campaign(campaign, %{
+                 sent_count: stats.sent_count,
+                 delivered_count: stats.delivered_count,
+                 read_count: stats.read_count,
+                 replied_count: stats.replied_count,
+                 failed_count: stats.failed_count
+               }) do
+            {:ok, updated} -> updated
+            _ -> campaign
+          end
+
+        template_stats =
+          if updated_campaign.status == "completed" do
+            TitanFlow.Campaigns.MessageTracking.get_template_breakdown(campaign_id)
+          else
+            nil
+          end
+
+        failed_breakdown =
+          if (stats.failed_count || 0) > 0 do
+            TitanFlow.Campaigns.MessageTracking.get_failed_breakdown(campaign_id)
+          else
+            []
+          end
+
+        send(
+          caller,
+          {:campaign_stats_loaded, campaign_id, updated_campaign, stats, template_stats,
+           failed_breakdown}
+        )
+      rescue
+        error ->
+          Logger.warning(
+            "Failed to load campaign stats async for #{campaign_id}: #{inspect(error)}"
+          )
+      end
+    end)
   end
 
   defp update_retrying_campaigns(retrying_campaigns, campaigns) do
@@ -620,6 +697,7 @@ defmodule TitanFlowWeb.CampaignsLive do
         else: "-"
 
     queue_warn = assigns.webhook_queue_depth >= @webhook_queue_warn_threshold
+    failed_breakdown = assigns[:failed_breakdown] || []
 
     assigns =
       assigns
@@ -635,6 +713,7 @@ defmodule TitanFlowWeb.CampaignsLive do
       |> assign(:completed_at, campaign_completed_at)
       |> assign(:webhook_queue_warn, queue_warn)
       |> assign(:active_phone_statuses, active_phone_statuses)
+      |> assign(:failed_breakdown, failed_breakdown)
 
     ~H"""
     <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" phx-click="close_stats">
@@ -672,6 +751,14 @@ defmodule TitanFlowWeb.CampaignsLive do
         </div>
         
         <div class="p-6 space-y-5">
+          <%= if @campaign.error_message && String.trim(@campaign.error_message) != "" do %>
+            <div class="bg-amber-500/10 rounded-lg p-4 border border-amber-500/30">
+              <div class="text-sm font-medium text-amber-300">Remarks</div>
+              <div class="text-xs text-amber-400/80 mt-1">
+                <%= @campaign.error_message %>
+              </div>
+            </div>
+          <% end %>
           <!-- Timeline & Progress -->
           <div class="bg-zinc-800/50 rounded-lg p-4 space-y-3 border border-zinc-800">
              <div class="flex justify-between text-xs text-zinc-500">
@@ -852,36 +939,33 @@ defmodule TitanFlowWeb.CampaignsLive do
             </div>
           <% end %>
 
-          <!-- Failed Messages Table -->
-          <%= if @failed_messages && length(@failed_messages) > 0 do %>
+          <!-- Failed Breakdown -->
+          <%= if length(@failed_breakdown) > 0 do %>
             <div>
-               <h3 class="text-xs font-medium text-zinc-400 uppercase tracking-wider mb-3">Failed Messages Details</h3>
-               <div class="overflow-hidden rounded-lg border border-zinc-800 max-h-48 overflow-y-auto">
-                 <table class="min-w-full">
-                   <thead class="sticky top-0">
-                     <tr class="border-b border-zinc-800 bg-zinc-800/50">
-                       <th class="px-4 py-2 text-left text-xs font-medium text-zinc-400 uppercase">Phone</th>
-                       <th class="px-4 py-2 text-left text-xs font-medium text-zinc-400 uppercase">Error</th>
-                       <th class="px-4 py-2 text-left text-xs font-medium text-zinc-400 uppercase">Time</th>
-                     </tr>
-                   </thead>
-                   <tbody class="divide-y divide-zinc-800">
-                     <%= for msg <- @failed_messages do %>
-                       <tr class="text-sm">
-                         <td class="px-4 py-2 font-mono text-zinc-300"><%= msg.recipient_phone %></td>
-                         <td class="px-4 py-2 text-red-400 text-xs">
-                           <span class="font-medium">(#<%= msg.error_code || "?" %>)</span> <%= msg.error_message || "Unknown error" %>
-                         </td>
-                         <td class="px-4 py-2 text-zinc-500 text-xs font-mono">
-                           <%= if msg.sent_at, do: DateTimeHelpers.format_table_datetime(msg.sent_at), else: "-" %>
-                         </td>
-                       </tr>
-                     <% end %>
-                   </tbody>
-                 </table>
-               </div>
+              <h3 class="text-xs font-medium text-zinc-400 uppercase tracking-wider mb-3">Failed Breakdown</h3>
+              <div class="overflow-hidden rounded-lg border border-zinc-800 max-h-48 overflow-y-auto">
+                <table class="min-w-full">
+                  <thead class="sticky top-0">
+                    <tr class="border-b border-zinc-800 bg-zinc-800/50">
+                      <th class="px-4 py-2 text-left text-xs font-medium text-zinc-400 uppercase">Error Code</th>
+                      <th class="px-4 py-2 text-left text-xs font-medium text-zinc-400 uppercase">Error Message</th>
+                      <th class="px-4 py-2 text-right text-xs font-medium text-zinc-400 uppercase">Count</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-zinc-800">
+                    <%= for row <- @failed_breakdown do %>
+                      <tr class="text-sm">
+                        <td class="px-4 py-2 font-mono text-zinc-300"><%= row.error_code || "?" %></td>
+                        <td class="px-4 py-2 text-zinc-400 text-xs"><%= row.error_message || "-" %></td>
+                        <td class="px-4 py-2 text-right text-zinc-400 font-mono"><%= row.count %></td>
+                      </tr>
+                    <% end %>
+                  </tbody>
+                </table>
+              </div>
             </div>
           <% end %>
+
         </div>
       </div>
     </div>

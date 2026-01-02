@@ -259,6 +259,14 @@ defmodule TitanFlow.Campaigns.Pipeline do
     Redix.command(:redix, ["RPUSH", queue_name, data])
   end
 
+  def handle_spam_rate_limit(campaign_id, phone_number_id) do
+    maybe_handle_spam_rate_limit(campaign_id, phone_number_id)
+  end
+
+  def exhaust_phone(campaign_id, phone_number_id) do
+    mark_phone_exhausted(campaign_id, phone_number_id)
+  end
+
   defp maybe_handle_spam_rate_limit(campaign_id, phone_number_id) do
     now_ms = System.system_time(:millisecond)
     window_key = "campaign:#{campaign_id}:phone:#{phone_number_id}:131048_window"

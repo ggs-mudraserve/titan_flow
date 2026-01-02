@@ -23,7 +23,9 @@ defmodule TitanFlow.Faqs.FaqAnswer do
     |> cast(attrs, [:faq_set_id, :answer_text, :normalized_answer, :active])
     |> validate_required([:faq_set_id, :answer_text])
     |> maybe_normalize_answer()
-    |> unique_constraint(:normalized_answer, name: :faq_answers_faq_set_id_normalized_answer_index)
+    |> unique_constraint(:normalized_answer,
+      name: :faq_answers_faq_set_id_normalized_answer_index
+    )
   end
 
   defp maybe_normalize_answer(changeset) do

@@ -28,6 +28,7 @@ defmodule TitanFlow.Campaigns.Orchestrator do
   @preflight_wait_ms 5_000
   @preflight_var1 "Nitin"
   @preflight_var2 "test"
+  @auto_redistribute_lock_ms 120_000
 
   alias TitanFlow.Campaigns
   alias TitanFlow.Campaigns.{Cache, Importer, Pipeline}
@@ -132,32 +133,43 @@ defmodule TitanFlow.Campaigns.Orchestrator do
     verified_phones = verify_phones(campaign, phones, phone_template_map)
 
     if Enum.empty?(verified_phones) do
-      raise "Pre-flight failed: No phones passed verification. Check phone billing/template status."
-    end
+      error_msg = "Pre-flight failed: All selected numbers failed verification. Campaign paused."
 
-    if length(verified_phones) < length(phones) do
-      failed_phones = phones -- verified_phones
+      Logger.warning("Campaign #{campaign.id}: #{error_msg}")
 
-      Logger.warning(
-        "Campaign #{campaign.id}: #{length(failed_phones)} phones failed pre-flight: #{inspect(Enum.map(failed_phones, & &1.id))}"
+      Campaigns.update_campaign(campaign, %{
+        status: "paused",
+        error_message: error_msg
+      })
+
+      {:error, error_msg}
+    else
+      if length(verified_phones) < length(phones) do
+        failed_phones = phones -- verified_phones
+
+        Logger.warning(
+          "Campaign #{campaign.id}: #{length(failed_phones)} phones failed pre-flight: #{inspect(Enum.map(failed_phones, & &1.id))}"
+        )
+      end
+
+      assignment_mode =
+        maybe_redistribute_remaining_contacts(campaign, verified_phones, phone_mps_map)
+
+      # Step 2: Build weighted phone distribution based on MPS
+      weighted_map = build_weighted_phone_map(verified_phones, phone_mps_map)
+
+      # Step 3: Start BufferManagers with weighted distribution
+      Logger.info(
+        "Campaign #{campaign.id}: Starting BufferManagers with weighted distribution for #{length(verified_phones)} phones"
       )
-    end
 
-    # Step 2: Build weighted phone distribution based on MPS
-    weighted_map = build_weighted_phone_map(verified_phones, phone_mps_map)
+      verified_phones
+      |> Enum.each(fn phone ->
+        # Get template IDs for this specific phone
+        phone_template_ids = Map.get(phone_template_map, phone.id, [])
 
-    # Step 3: Start BufferManagers with weighted distribution
-    Logger.info(
-      "Campaign #{campaign.id}: Starting BufferManagers with weighted distribution for #{length(verified_phones)} phones"
-    )
-
-    verified_phones
-    |> Enum.each(fn phone ->
-      # Get template IDs for this specific phone
-      phone_template_ids = Map.get(phone_template_map, phone.id, [])
-
-      if Enum.empty?(phone_template_ids) do
-        Logger.warning("Campaign #{campaign.id}: No templates configured for phone #{phone.id}")
+        if Enum.empty?(phone_template_ids) do
+          Logger.warning("Campaign #{campaign.id}: No templates configured for phone #{phone.id}")
       end
 
       # Start rate limiter for this phone if not already running
@@ -190,7 +202,8 @@ defmodule TitanFlow.Campaigns.Orchestrator do
              campaign_id: campaign.id,
              phone_number_id: phone.phone_number_id,
              weighted_indices: weighted_indices,
-             total_slots: total_slots
+             total_slots: total_slots,
+             assignment_mode: assignment_mode
            }) do
         {:ok, pid} ->
           Logger.info(
@@ -241,11 +254,12 @@ defmodule TitanFlow.Campaigns.Orchestrator do
       end
     end)
 
-    # Step 3: Update campaign status
-    Campaigns.update_campaign(campaign, %{status: "running", started_at: NaiveDateTime.utc_now()})
-    Logger.info("Campaign #{campaign.id}: Status set to running")
+      # Step 3: Update campaign status
+      Campaigns.update_campaign(campaign, %{status: "running", started_at: NaiveDateTime.utc_now()})
+      Logger.info("Campaign #{campaign.id}: Status set to running")
 
-    {:ok, campaign}
+      {:ok, campaign}
+    end
   end
 
   @doc """
@@ -347,10 +361,35 @@ defmodule TitanFlow.Campaigns.Orchestrator do
     end
   end
 
+  @doc """
+  Restart a paused/error campaign as a fresh run with new senders/templates.
+  Clears campaign runtime state (queues, exhausted phones, failed templates),
+  then runs the same orchestration flow as a new campaign start.
+  """
+  def restart_campaign(campaign, phone_ids, template_ids, previous_phone_ids \\ nil) do
+    reset_campaign_runtime_state(campaign.id, previous_phone_ids || phone_ids)
+    _ =
+      Redix.command(:redix, [
+        "SET",
+        "campaign:#{campaign.id}:redistribute_on_start",
+        "1",
+        "EX",
+        "3600"
+      ])
+
+    try do
+      TitanFlow.Templates.TemplateCache.refresh()
+    rescue
+      _ -> :ok
+    end
+    start_campaign(campaign, phone_ids, template_ids, nil)
+  end
+
   defp restart_pipelines(campaign, opts) do
     alias TitanFlow.Campaigns.BufferManager
 
     force_restart = Keyword.get(opts, :force, false)
+    assignment_mode = assignment_mode?(campaign.id)
 
     phone_ids =
       case campaign.senders_config do
@@ -409,7 +448,8 @@ defmodule TitanFlow.Campaigns.Orchestrator do
                    campaign_id: campaign.id,
                    phone_number_id: phone.phone_number_id,
                    weighted_indices: weighted_indices,
-                   total_slots: total_slots
+                   total_slots: total_slots,
+                   assignment_mode: assignment_mode
                  }) do
               {:ok, pid} ->
                 Logger.info(
@@ -474,6 +514,344 @@ defmodule TitanFlow.Campaigns.Orchestrator do
         end
       end)
     end
+  end
+
+  defp reset_campaign_runtime_state(campaign_id, phone_ids) do
+    # Stop any existing pipelines/buffers for a clean restart.
+    stop_pipelines_for_phone_ids(campaign_id, phone_ids)
+
+    # Clear pause flag so pipelines can dispatch immediately.
+    _ = Redix.command(:redix, ["DEL", "campaign:#{campaign_id}:paused"])
+    _ = Redix.command(:redix, ["DEL", "campaign:#{campaign_id}:assignment_mode"])
+    _ = Redix.command(:redix, ["DEL", "campaign:#{campaign_id}:redistribute_on_start"])
+
+    # Clear all campaign-scoped runtime keys (exhausted phones, failed templates, counters, etc).
+    {:ok, keys} = Redix.command(:redix, ["KEYS", "campaign:#{campaign_id}:*"])
+    Enum.each(keys || [], fn key -> Redix.command(:redix, ["DEL", key]) end)
+
+    delete_contact_assignments(campaign_id)
+
+    # Clear any queued messages for this campaign to avoid stale payloads.
+    {:ok, queue_keys} = Redix.command(:redix, ["KEYS", "queue:sending:#{campaign_id}:*"])
+    queue_keys = queue_keys || []
+
+    queue_phone_ids =
+      queue_keys
+      |> Enum.map(&queue_phone_number_id/1)
+      |> Enum.reject(&is_nil/1)
+
+    stop_pipelines_for_phone_number_ids(campaign_id, queue_phone_ids)
+    Enum.each(queue_keys, fn key -> Redix.command(:redix, ["DEL", key]) end)
+
+    :ok
+  end
+
+  defp stop_pipelines_for_phone_ids(campaign_id, phone_ids) do
+    phone_number_ids =
+      phone_ids
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.map(&WhatsApp.get_phone_number!/1)
+      |> Enum.map(& &1.phone_number_id)
+
+    stop_pipelines_for_phone_number_ids(campaign_id, phone_number_ids)
+  end
+
+  defp stop_pipelines_for_phone_number_ids(campaign_id, phone_number_ids) do
+    phone_number_ids
+    |> Enum.uniq()
+    |> Enum.each(fn phone_number_id ->
+      stop_pipeline_for_phone(phone_number_id)
+      stop_buffer_manager_for_phone(campaign_id, phone_number_id)
+    end)
+  end
+
+  defp queue_phone_number_id(key) when is_binary(key) do
+    case String.split(key, ":") do
+      ["queue", "sending", _campaign_id, phone_number_id] -> phone_number_id
+      _ -> nil
+    end
+  end
+
+  defp queue_phone_number_id(_), do: nil
+
+  defp assignment_mode?(campaign_id) do
+    case Redix.command(:redix, ["GET", "campaign:#{campaign_id}:assignment_mode"]) do
+      {:ok, "1"} -> true
+      _ -> false
+    end
+  end
+
+  defp maybe_redistribute_remaining_contacts(campaign, verified_phones, phone_mps_map) do
+    case Redix.command(:redix, ["GET", "campaign:#{campaign.id}:redistribute_on_start"]) do
+      {:ok, "1"} ->
+        _ = Redix.command(:redix, ["DEL", "campaign:#{campaign.id}:redistribute_on_start"])
+
+        case redistribute_remaining_contacts(campaign.id, verified_phones, phone_mps_map, []) do
+          :ok ->
+            _ = Redix.command(:redix, ["SET", "campaign:#{campaign.id}:assignment_mode", "1"])
+            true
+
+          {:error, reason} ->
+            Logger.error(
+              "Campaign #{campaign.id}: Redistribution failed, falling back to modulo: #{inspect(reason)}"
+            )
+
+            _ = Redix.command(:redix, ["DEL", "campaign:#{campaign.id}:assignment_mode"])
+            false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp redistribute_remaining_contacts(
+         campaign_id,
+         verified_phones,
+         phone_mps_map,
+         excluded_contact_ids
+       ) do
+    import Ecto.Query
+    alias TitanFlow.Repo
+
+    if Enum.empty?(verified_phones) do
+      {:error, :no_verified_phones}
+    else
+      weighted_map = build_weighted_phone_map(verified_phones, phone_mps_map)
+      total_slots = weighted_map.total_slots
+
+      if total_slots <= 0 do
+        {:error, :invalid_weights}
+      else
+        slots = build_weighted_slots(weighted_map)
+
+        Repo.delete_all(from a in "contact_assignments", where: a.campaign_id == ^campaign_id)
+
+        sql = """
+        WITH remaining AS (
+          SELECT c.id, row_number() OVER (ORDER BY c.id) AS rn
+          FROM contacts c
+          LEFT JOIN message_logs m
+            ON m.contact_id = c.id AND m.campaign_id = c.campaign_id
+          WHERE c.campaign_id = $1
+            AND c.is_blacklisted = false
+            AND m.id IS NULL
+            AND NOT (c.id = ANY($4::bigint[]))
+        ),
+        assigned AS (
+          SELECT id AS contact_id,
+                 $2[((rn - 1) % $3) + 1] AS phone_number_id
+          FROM remaining
+        )
+        INSERT INTO contact_assignments (campaign_id, contact_id, phone_number_id, inserted_at, updated_at)
+        SELECT $1, contact_id, phone_number_id, NOW(), NOW()
+        FROM assigned
+        ON CONFLICT (campaign_id, contact_id) DO UPDATE
+        SET phone_number_id = EXCLUDED.phone_number_id, updated_at = NOW()
+        """
+
+        exclude_ids = excluded_contact_ids || []
+
+        case Repo.query(sql, [campaign_id, slots, total_slots, exclude_ids]) do
+          {:ok, _} ->
+            Logger.info(
+              "Campaign #{campaign_id}: Redistributed remaining contacts across #{length(verified_phones)} phones"
+            )
+
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end
+    end
+  end
+
+  defp build_weighted_slots(%{phone_indices: phone_indices, total_slots: total_slots}) do
+    index_map =
+      Enum.reduce(phone_indices, %{}, fn {phone_number_id, indices}, acc ->
+        Enum.reduce(indices, acc, fn idx, acc_inner ->
+          Map.put(acc_inner, idx, phone_number_id)
+        end)
+      end)
+
+    Enum.map(0..(total_slots - 1), fn idx ->
+      Map.fetch!(index_map, idx)
+    end)
+  end
+
+  defp delete_contact_assignments(campaign_id) do
+    import Ecto.Query
+    alias TitanFlow.Repo
+
+    try do
+      Repo.delete_all(from a in "contact_assignments", where: a.campaign_id == ^campaign_id)
+    rescue
+      _ -> :ok
+    end
+  end
+
+  def maybe_redistribute_on_exhaustion(campaign_id) do
+    lock_key = "campaign:#{campaign_id}:auto_redistribute_lock"
+
+    case Redix.command(:redix, [
+           "SET",
+           lock_key,
+           "1",
+           "PX",
+           @auto_redistribute_lock_ms,
+           "NX"
+         ]) do
+      {:ok, "OK"} ->
+        Task.start(fn -> auto_redistribute_remaining_contacts(campaign_id) end)
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp auto_redistribute_remaining_contacts(campaign_id) do
+    campaign = Campaigns.get_campaign!(campaign_id)
+
+    cond do
+      campaign.status != "running" ->
+        :ok
+
+      is_paused?(campaign_id) ->
+        :ok
+
+      retry_mode?(campaign_id) ->
+        :ok
+
+      true ->
+        phone_ids =
+          case campaign.senders_config do
+            config when is_list(config) and length(config) > 0 ->
+              config
+              |> Enum.map(& &1["phone_id"])
+              |> Enum.reject(&is_nil/1)
+              |> Enum.uniq()
+
+            _ ->
+              campaign.phone_ids || []
+          end
+
+        if length(phone_ids) <= 1 do
+          :ok
+        else
+          phones = Enum.map(phone_ids, &WhatsApp.get_phone_number!/1)
+          phone_mps_map = build_phone_mps_map(campaign, phone_ids)
+
+          {:ok, exhausted_numbers} =
+            Redix.command(:redix, ["SMEMBERS", "campaign:#{campaign_id}:exhausted_phones"])
+
+          exhausted_set = MapSet.new(exhausted_numbers || [])
+
+          active_phones =
+            Enum.filter(phones, fn phone ->
+              not MapSet.member?(exhausted_set, phone.phone_number_id)
+            end)
+
+          if length(active_phones) <= 1 do
+            :ok
+          else
+            queued_ids = queued_contact_ids(campaign_id, phones)
+
+            case redistribute_remaining_contacts(
+                   campaign_id,
+                   active_phones,
+                   phone_mps_map,
+                   queued_ids
+                 ) do
+              :ok ->
+                _ = Redix.command(:redix, ["SET", "campaign:#{campaign_id}:assignment_mode", "1"])
+
+                weighted_map = build_weighted_phone_map(active_phones, phone_mps_map)
+                restart_buffer_managers_with_assignment(campaign, active_phones, weighted_map)
+                ensure_pipelines_running(campaign_id)
+                :ok
+
+              {:error, reason} ->
+                Logger.error(
+                  "Campaign #{campaign_id}: Auto-redistribute failed: #{inspect(reason)}"
+                )
+
+                :ok
+            end
+          end
+        end
+    end
+  end
+
+  defp restart_buffer_managers_with_assignment(campaign, phones, weighted_map) do
+    alias TitanFlow.Campaigns.BufferManager
+
+    Enum.each(phones, fn phone ->
+      stop_buffer_manager_for_phone(campaign.id, phone.phone_number_id)
+
+      weighted_indices = Map.get(weighted_map.phone_indices, phone.phone_number_id, [0])
+
+      DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
+        BufferManager,
+        campaign_id: campaign.id,
+        phone_number_id: phone.phone_number_id,
+        weighted_indices: weighted_indices,
+        total_slots: weighted_map.total_slots,
+        assignment_mode: true
+      })
+    end)
+  end
+
+  defp queued_contact_ids(campaign_id, phones) do
+    phones
+    |> Enum.map(& &1.phone_number_id)
+    |> Enum.reduce(MapSet.new(), fn phone_number_id, acc ->
+      queue_key = "queue:sending:#{campaign_id}:#{phone_number_id}"
+
+      case Redix.command(:redix, ["LRANGE", queue_key, "0", "-1"]) do
+        {:ok, items} when is_list(items) ->
+          Enum.reduce(items, acc, fn item, acc_inner ->
+            case Jason.decode(item) do
+              {:ok, %{"contact_id" => contact_id}} ->
+                case parse_contact_id(contact_id) do
+                  nil -> acc_inner
+                  id -> MapSet.put(acc_inner, id)
+                end
+
+              _ ->
+                acc_inner
+            end
+          end)
+
+        _ ->
+          acc
+      end
+    end)
+    |> MapSet.to_list()
+  end
+
+  defp parse_contact_id(contact_id) when is_integer(contact_id), do: contact_id
+  defp parse_contact_id(contact_id) when is_binary(contact_id) do
+    case Integer.parse(contact_id) do
+      {id, _} -> id
+      _ -> nil
+    end
+  end
+  defp parse_contact_id(_), do: nil
+
+  defp retry_mode?(campaign_id) do
+    case Redix.command(:redix, ["GET", "campaign:#{campaign_id}:retry_mode"]) do
+      {:ok, "1"} -> true
+      _ -> false
+    end
+  end
+
+  def ensure_pipelines_running(campaign_id) do
+    campaign = Campaigns.get_campaign!(campaign_id)
+    restart_pipelines(campaign, force: false)
+    :ok
   end
 
   @doc """
