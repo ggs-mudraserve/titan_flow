@@ -19,8 +19,8 @@ defmodule TitanFlow.Campaigns.WebhookBatcher do
   alias TitanFlow.Repo
   alias TitanFlow.Campaigns.MessageTracking
 
-  @flush_interval_ms 2_000
-  @batch_size 800
+  @flush_interval_ms 1_500
+  @batch_size 1_000
   @buffer_key "buffer:webhook_updates"
   # Drop updates older than 30s
   @requeue_ttl_ms 30_000

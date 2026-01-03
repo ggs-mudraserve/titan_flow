@@ -140,20 +140,16 @@ defmodule TitanFlow.Campaigns.AutoScaler do
   end
 
   defp get_active_queues do
-    case Redix.command(:redix, ["KEYS", "queue:sending:*"]) do
-      {:ok, keys} when is_list(keys) ->
-        keys
-        |> Enum.map(&parse_queue_key/1)
-        |> Enum.reject(&is_nil/1)
-        |> Enum.map(fn {campaign_id, phone_id, key} ->
-          depth = get_queue_depth(key)
-          {phone_id, %{campaign_id: campaign_id, depth: depth}}
-        end)
-        |> Enum.into(%{})
+    keys = scan_keys("queue:sending:*")
 
-      _ ->
-        %{}
-    end
+    keys
+    |> Enum.map(&parse_queue_key/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(fn {campaign_id, phone_id, key} ->
+      depth = get_queue_depth(key)
+      {phone_id, %{campaign_id: campaign_id, depth: depth}}
+    end)
+    |> Enum.into(%{})
   end
 
   defp parse_queue_key(key) do
@@ -210,6 +206,26 @@ defmodule TitanFlow.Campaigns.AutoScaler do
       _ -> :ok
     catch
       :exit, _ -> :ok
+    end
+  end
+
+  defp scan_keys(pattern, count \\ 1000) do
+    scan_keys("0", pattern, count, [])
+  end
+
+  defp scan_keys(cursor, pattern, count, acc) do
+    case Redix.command(:redix, ["SCAN", cursor, "MATCH", pattern, "COUNT", count]) do
+      {:ok, [next_cursor, keys]} when is_list(keys) ->
+        new_acc = acc ++ keys
+
+        if next_cursor == "0" do
+          new_acc
+        else
+          scan_keys(next_cursor, pattern, count, new_acc)
+        end
+
+      _ ->
+        acc
     end
   end
 end

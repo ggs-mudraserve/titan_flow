@@ -121,19 +121,19 @@ defmodule TitanFlow.Campaigns.MetricsReporter do
 
   defp get_total_queue_depth do
     # Sum queue depths across all campaign:phone combinations
-    case Redix.command(:redix, ["KEYS", "queue:sending:*"]) do
-      {:ok, keys} when is_list(keys) and length(keys) > 0 ->
-        keys
-        |> Enum.map(fn key ->
-          case Redix.command(:redix, ["LLEN", key]) do
-            {:ok, len} when is_integer(len) -> len
-            _ -> 0
-          end
-        end)
-        |> Enum.sum()
+    keys = scan_keys("queue:sending:*")
 
-      _ ->
-        0
+    if length(keys) > 0 do
+      keys
+      |> Enum.map(fn key ->
+        case Redix.command(:redix, ["LLEN", key]) do
+          {:ok, len} when is_integer(len) -> len
+          _ -> 0
+        end
+      end)
+      |> Enum.sum()
+    else
+      0
     end
   end
 
@@ -155,21 +155,17 @@ defmodule TitanFlow.Campaigns.MetricsReporter do
 
   defp get_total_sent do
     # Sum sent counts across all running campaigns
-    case Redix.command(:redix, ["KEYS", "campaign:*:sent_count"]) do
-      {:ok, keys} when is_list(keys) ->
-        keys
-        |> Enum.map(fn key ->
-          case Redix.command(:redix, ["GET", key]) do
-            {:ok, nil} -> 0
-            {:ok, val} -> String.to_integer(val)
-            _ -> 0
-          end
-        end)
-        |> Enum.sum()
+    keys = scan_keys("campaign:*:sent_count")
 
-      _ ->
-        0
-    end
+    keys
+    |> Enum.map(fn key ->
+      case Redix.command(:redix, ["GET", key]) do
+        {:ok, nil} -> 0
+        {:ok, val} -> String.to_integer(val)
+        _ -> 0
+      end
+    end)
+    |> Enum.sum()
   end
 
   defp get_running_campaign_count do
@@ -181,5 +177,25 @@ defmodule TitanFlow.Campaigns.MetricsReporter do
     )
   rescue
     _ -> 0
+  end
+
+  defp scan_keys(pattern, count \\ 1000) do
+    scan_keys("0", pattern, count, [])
+  end
+
+  defp scan_keys(cursor, pattern, count, acc) do
+    case Redix.command(:redix, ["SCAN", cursor, "MATCH", pattern, "COUNT", count]) do
+      {:ok, [next_cursor, keys]} when is_list(keys) ->
+        new_acc = acc ++ keys
+
+        if next_cursor == "0" do
+          new_acc
+        else
+          scan_keys(next_cursor, pattern, count, new_acc)
+        end
+
+      _ ->
+        acc
+    end
   end
 end

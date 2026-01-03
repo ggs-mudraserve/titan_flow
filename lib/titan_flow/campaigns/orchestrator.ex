@@ -526,14 +526,13 @@ defmodule TitanFlow.Campaigns.Orchestrator do
     _ = Redix.command(:redix, ["DEL", "campaign:#{campaign_id}:redistribute_on_start"])
 
     # Clear all campaign-scoped runtime keys (exhausted phones, failed templates, counters, etc).
-    {:ok, keys} = Redix.command(:redix, ["KEYS", "campaign:#{campaign_id}:*"])
-    Enum.each(keys || [], fn key -> Redix.command(:redix, ["DEL", key]) end)
+    keys = scan_keys("campaign:#{campaign_id}:*")
+    Enum.each(keys, fn key -> Redix.command(:redix, ["DEL", key]) end)
 
     delete_contact_assignments(campaign_id)
 
     # Clear any queued messages for this campaign to avoid stale payloads.
-    {:ok, queue_keys} = Redix.command(:redix, ["KEYS", "queue:sending:#{campaign_id}:*"])
-    queue_keys = queue_keys || []
+    queue_keys = scan_keys("queue:sending:#{campaign_id}:*")
 
     queue_phone_ids =
       queue_keys
@@ -901,13 +900,13 @@ defmodule TitanFlow.Campaigns.Orchestrator do
     end
 
     # Step 2: Clear ALL campaign Redis state (exhausted phones, failed templates)
-    {:ok, keys} = Redix.command(:redix, ["KEYS", "campaign:#{campaign_id}:*"])
+    keys = scan_keys("campaign:#{campaign_id}:*")
 
-    for key <- keys || [] do
+    for key <- keys do
       Redix.command(:redix, ["DEL", key])
     end
 
-    Logger.info("Cleared #{length(keys || [])} Redis keys for campaign #{campaign_id}")
+    Logger.info("Cleared #{length(keys)} Redis keys for campaign #{campaign_id}")
 
     # Mark retry mode to prevent premature completion based on historical counts
     _ =
@@ -1433,9 +1432,29 @@ defmodule TitanFlow.Campaigns.Orchestrator do
       case results do
         {:ok, message_ids} -> {:ok, phone, Enum.reverse(message_ids)}
         {:error, _phone, _reason} = error -> error
-      end
     end
   end
+
+  defp scan_keys(pattern, count \\ 1000) do
+    scan_keys("0", pattern, count, [])
+  end
+
+  defp scan_keys(cursor, pattern, count, acc) do
+    case Redix.command(:redix, ["SCAN", cursor, "MATCH", pattern, "COUNT", count]) do
+      {:ok, [next_cursor, keys]} when is_list(keys) ->
+        new_acc = acc ++ keys
+
+        if next_cursor == "0" do
+          new_acc
+        else
+          scan_keys(next_cursor, pattern, count, new_acc)
+        end
+
+      _ ->
+        acc
+    end
+  end
+end
 
   # Check if test message was marked as failed by webhook
   # No message to check (no contacts)
