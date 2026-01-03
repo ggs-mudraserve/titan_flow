@@ -1432,6 +1432,7 @@ defmodule TitanFlow.Campaigns.Orchestrator do
       case results do
         {:ok, message_ids} -> {:ok, phone, Enum.reverse(message_ids)}
         {:error, _phone, _reason} = error -> error
+      end
     end
   end
 
@@ -1454,7 +1455,6 @@ defmodule TitanFlow.Campaigns.Orchestrator do
         acc
     end
   end
-end
 
   # Check if test message was marked as failed by webhook
   # No message to check (no contacts)
