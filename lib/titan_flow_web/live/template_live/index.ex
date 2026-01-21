@@ -407,6 +407,78 @@ defmodule TitanFlowWeb.TemplateLive.Index do
     end
   end
 
+  def handle_event("create_clone_bulk", _params, socket) do
+    template = socket.assigns.cloning_template
+    target_phone_id = socket.assigns.target_phone_id
+
+    if is_nil(template) do
+      {:noreply, put_flash(socket, :error, "No template selected")}
+    else
+      target_phone = Enum.find(socket.assigns.phone_numbers, fn p -> p.id == target_phone_id end)
+
+      case target_phone do
+        %{} = phone ->
+          language = socket.assigns.clone_language || template.language || "en_US"
+          components =
+            build_clone_components(
+              template.components,
+              socket.assigns.clone_body_text,
+              socket.assigns.media_handle,
+              socket.assigns.media_type,
+              socket.assigns.clone_buttons,
+              socket.assigns.variable_values
+            )
+          names = Enum.map(1..3, fn n -> "#{template.name}_copy_#{n}" end)
+
+          {ok_count, errors} =
+            Enum.reduce(names, {0, []}, fn name, {ok, errs} ->
+              case Templates.create_clone(
+                     template,
+                     name,
+                     components,
+                     language,
+                     phone.waba_id,
+                     phone.access_token
+                   ) do
+                {:ok, _} ->
+                  {ok + 1, errs}
+
+                {:error, {:api_error, _, body}} ->
+                  error_msg = get_in(body, ["error", "message"]) || "API error"
+                  {ok, ["#{name}: #{error_msg}" | errs]}
+
+                {:error, reason} ->
+                  {ok, ["#{name}: #{inspect(reason)}" | errs]}
+              end
+            end)
+
+          socket =
+            if ok_count == 3 do
+              put_flash(socket, :info, "Created 3 template copies. Pending approval.")
+            else
+              error_summary =
+                errors
+                |> Enum.reverse()
+                |> Enum.join("; ")
+
+              put_flash(
+                socket,
+                :error,
+                "Created #{ok_count}/3 copies. Failed: #{error_summary}"
+              )
+            end
+
+          {:noreply,
+           socket
+           |> assign(show_clone_modal: false)
+           |> load_templates()}
+
+        nil ->
+          {:noreply, put_flash(socket, :error, "Please select a phone number")}
+      end
+    end
+  end
+
   @impl true
   def handle_info({:sync_complete, result}, socket) do
     socket = assign(socket, syncing: false)
@@ -1257,6 +1329,13 @@ defmodule TitanFlowWeb.TemplateLive.Index do
                 class="px-5 py-2.5 bg-primary text-primary-content rounded-lg font-medium text-sm hover:bg-primary/90 transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-wait active:scale-95"
               >
                 📋 Duplicate Template
+              </button>
+              <button
+                phx-click="create_clone_bulk"
+                phx-disable-with="⏳ Creating 3..."
+                class="px-5 py-2.5 bg-secondary text-secondary-content rounded-lg font-medium text-sm hover:bg-secondary/90 transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-wait active:scale-95"
+              >
+                📋 Duplicate 3 Copies
               </button>
             </div>
           </div>

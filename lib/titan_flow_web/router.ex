@@ -37,6 +37,7 @@ defmodule TitanFlowWeb.Router do
     live "/campaigns", CampaignsLive
     live "/campaigns/new", CampaignLive.New
     live "/campaigns/:id/resume", CampaignLive.Resume
+    live "/campaigns/:id/retry", CampaignLive.Retry
     live "/inbox", InboxLive.Index
     live "/numbers", NumberLive.Index, :index
     live "/numbers/new", NumberLive.Index, :new

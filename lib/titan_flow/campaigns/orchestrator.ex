@@ -431,7 +431,7 @@ defmodule TitanFlow.Campaigns.Orchestrator do
         start_rate_limiter(phone, phone_mps)
 
         if force_restart do
-          stop_pipeline_for_phone(phone.phone_number_id)
+          stop_pipeline_for_phone(phone.phone_number_id, wait: true)
         end
 
         weighted_indices = Map.get(weighted_map.phone_indices, phone.phone_number_id, [0])
@@ -473,44 +473,47 @@ defmodule TitanFlow.Campaigns.Orchestrator do
             )
         end
 
-        # Check if Pipeline already exists
-        case Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone.phone_number_id) do
-          [] ->
-            # Start Pipeline with phone-specific template IDs under supervision
-            pipeline_spec = %{
-              id: {:pipeline, phone.phone_number_id},
-              start:
-                {Pipeline, :start_link,
-                 [
-                   [
-                     phone_number_id: phone.phone_number_id,
-                     campaign_id: campaign.id,
-                     template_ids: phone_template_ids
-                   ]
-                 ]},
-              # ALWAYS restart
-              restart: :permanent
-            }
+        if force_restart do
+          case start_pipeline_with_retry(
+                 campaign.id,
+                 phone.phone_number_id,
+                 phone_template_ids
+               ) do
+            {:ok, pid} ->
+              Logger.info(
+                "Campaign #{campaign.id}: Restarted pipeline under supervision for phone #{phone.phone_number_id} - #{inspect(pid)}"
+              )
 
-            case DynamicSupervisor.start_child(
-                   TitanFlow.Campaigns.PipelineSupervisor,
-                   pipeline_spec
-                 ) do
-              {:ok, pid} ->
-                Logger.info(
-                  "Campaign #{campaign.id}: Restarted pipeline under supervision for phone #{phone.phone_number_id} - #{inspect(pid)}"
-                )
+            {:error, reason} ->
+              Logger.error(
+                "Campaign #{campaign.id}: Failed to restart pipeline: #{inspect(reason)}"
+              )
+          end
+        else
+          # Check if Pipeline already exists
+          case Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone.phone_number_id) do
+            [] ->
+              case start_pipeline_with_retry(
+                     campaign.id,
+                     phone.phone_number_id,
+                     phone_template_ids
+                   ) do
+                {:ok, pid} ->
+                  Logger.info(
+                    "Campaign #{campaign.id}: Restarted pipeline under supervision for phone #{phone.phone_number_id} - #{inspect(pid)}"
+                  )
 
-              {:error, reason} ->
-                Logger.error(
-                  "Campaign #{campaign.id}: Failed to restart pipeline: #{inspect(reason)}"
-                )
-            end
+                {:error, reason} ->
+                  Logger.error(
+                    "Campaign #{campaign.id}: Failed to restart pipeline: #{inspect(reason)}"
+                  )
+              end
 
-          _ ->
-            Logger.info(
-              "Campaign #{campaign.id}: Pipeline already running for phone #{phone.phone_number_id}"
-            )
+            _ ->
+              Logger.info(
+                "Campaign #{campaign.id}: Pipeline already running for phone #{phone.phone_number_id}"
+              )
+          end
         end
       end)
     end
@@ -631,16 +634,17 @@ defmodule TitanFlow.Campaigns.Orchestrator do
         WITH remaining AS (
           SELECT c.id, row_number() OVER (ORDER BY c.id) AS rn
           FROM contacts c
-          LEFT JOIN message_logs m
-            ON m.contact_id = c.id AND m.campaign_id = c.campaign_id
           WHERE c.campaign_id = $1
             AND c.is_blacklisted = false
-            AND m.id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM message_logs m
+              WHERE m.contact_id = c.id AND m.campaign_id = c.campaign_id
+            )
             AND NOT (c.id = ANY($4::bigint[]))
         ),
         assigned AS (
           SELECT id AS contact_id,
-                 $2[((rn - 1) % $3) + 1] AS phone_number_id
+                 ($2::text[])[((rn - 1) % $3) + 1] AS phone_number_id
           FROM remaining
         )
         INSERT INTO contact_assignments (campaign_id, contact_id, phone_number_id, inserted_at, updated_at)
@@ -664,6 +668,154 @@ defmodule TitanFlow.Campaigns.Orchestrator do
             {:error, reason}
         end
       end
+    end
+  end
+
+  defp redistribute_retry_contacts(
+         campaign_id,
+         verified_phones,
+         phone_mps_map,
+         excluded_contact_ids
+       ) do
+    import Ecto.Query
+    alias TitanFlow.Repo
+
+    if Enum.empty?(verified_phones) do
+      {:error, :no_verified_phones}
+    else
+      weighted_map = build_weighted_phone_map(verified_phones, phone_mps_map)
+      total_slots = weighted_map.total_slots
+
+      if total_slots <= 0 do
+        {:error, :invalid_weights}
+      else
+        slots = build_weighted_slots(weighted_map)
+
+        sql = """
+        WITH retryable_failed AS MATERIALIZED (
+          SELECT cs.contact_id
+          FROM campaign_contact_status cs
+          JOIN contacts c ON c.id = cs.contact_id
+          WHERE cs.campaign_id = $1
+            AND c.campaign_id = $1
+            AND c.is_blacklisted = false
+            AND cs.last_status = 'failed'
+            AND (cs.last_error_code IN ('131042', '131048', '130429', 'PHONE_EXHAUSTED') OR cs.last_error_code LIKE '132%')
+        ),
+        nolog AS MATERIALIZED (
+          SELECT c.id AS contact_id
+          FROM contacts c
+          LEFT JOIN campaign_contact_status cs
+            ON cs.campaign_id = c.campaign_id AND cs.contact_id = c.id
+          WHERE c.campaign_id = $1
+            AND c.is_blacklisted = false
+            AND cs.contact_id IS NULL
+        ),
+        retry_candidates AS (
+          SELECT contact_id FROM retryable_failed
+          UNION
+          SELECT contact_id FROM nolog
+        ),
+        ranked AS (
+          SELECT rc.contact_id, row_number() OVER (ORDER BY rc.contact_id) AS rn
+          FROM retry_candidates rc
+          WHERE NOT (rc.contact_id = ANY($4::bigint[]))
+        )
+        INSERT INTO contact_assignments (campaign_id, contact_id, phone_number_id, inserted_at, updated_at)
+        SELECT $1, contact_id, ($2::text[])[((rn - 1) % $3) + 1], NOW(), NOW()
+        FROM ranked
+        ON CONFLICT (campaign_id, contact_id) DO UPDATE
+        SET phone_number_id = EXCLUDED.phone_number_id, updated_at = NOW()
+        """
+
+        exclude_ids = excluded_contact_ids || []
+
+        result =
+          Repo.transaction(
+            fn ->
+              case Repo.query("SET LOCAL statement_timeout = 300000", []) do
+                {:ok, _} ->
+                  Repo.delete_all(
+                    from a in "contact_assignments",
+                      where: a.campaign_id == ^campaign_id
+                  )
+
+                  case Repo.query(sql, [campaign_id, slots, total_slots, exclude_ids]) do
+                    {:ok, _} -> :ok
+                    {:error, reason} -> Repo.rollback(reason)
+                  end
+
+                {:error, reason} ->
+                  Repo.rollback(reason)
+              end
+            end,
+            timeout: 310_000
+          )
+
+        case result do
+          {:ok, :ok} ->
+            Logger.info(
+              "Campaign #{campaign_id}: Assigned retry candidates across #{length(verified_phones)} phones"
+            )
+
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end
+    end
+  end
+
+  defp ensure_contact_status_backfilled(campaign_id) do
+    alias TitanFlow.Repo
+
+    case Repo.query("SELECT 1 FROM campaign_contact_status WHERE campaign_id = $1 LIMIT 1", [
+           campaign_id
+         ]) do
+      {:ok, %{num_rows: 0}} ->
+        sql = """
+        WITH latest AS MATERIALIZED (
+          SELECT DISTINCT ON (m.contact_id) m.campaign_id, m.contact_id, m.status, m.error_code
+          FROM message_logs m
+          WHERE m.campaign_id = $1
+            AND m.contact_id IS NOT NULL
+          ORDER BY m.contact_id, m.inserted_at DESC
+        )
+        INSERT INTO campaign_contact_status (campaign_id, contact_id, last_status, last_error_code, inserted_at, updated_at)
+        SELECT campaign_id, contact_id, status, error_code, NOW(), NOW()
+        FROM latest
+        ON CONFLICT (campaign_id, contact_id) DO UPDATE
+        SET last_status = EXCLUDED.last_status,
+            last_error_code = EXCLUDED.last_error_code,
+            updated_at = NOW()
+        """
+
+        Repo.transaction(
+          fn ->
+            case Repo.query("SET LOCAL statement_timeout = 600000", []) do
+              {:ok, _} ->
+                case Repo.query(sql, [campaign_id]) do
+                  {:ok, _} -> :ok
+                  {:error, reason} -> Repo.rollback(reason)
+                end
+
+              {:error, reason} ->
+                Repo.rollback(reason)
+            end
+          end,
+          timeout: 610_000
+        )
+        |> case do
+          {:ok, :ok} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -864,6 +1016,88 @@ defmodule TitanFlow.Campaigns.Orchestrator do
   end
 
   @doc """
+  Restart a single pipeline for a campaign phone without touching other phones.
+  Intended for manual recovery when a specific pipeline is paused/stopped.
+  """
+  def restart_pipeline_for_phone(campaign_id, phone_number_id) do
+    campaign = Campaigns.get_campaign!(campaign_id)
+
+    phone =
+      case WhatsApp.get_by_phone_number_id(phone_number_id) do
+        nil -> nil
+        phone -> phone
+      end
+
+    phone_ids =
+      case campaign.senders_config do
+        config when is_list(config) and length(config) > 0 ->
+          config
+          |> Enum.map(& &1["phone_id"])
+          |> Enum.reject(&is_nil/1)
+          |> Enum.uniq()
+
+        _ ->
+          campaign.phone_ids || []
+      end
+
+    cond do
+      campaign.status != "running" ->
+        {:error, :campaign_not_running}
+
+      is_nil(phone) ->
+        {:error, :phone_not_found}
+
+      phone.id not in phone_ids ->
+        {:error, :phone_not_in_campaign}
+
+      Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone.phone_number_id) != [] ->
+        {:ok, :already_running}
+
+      true ->
+        phones = Enum.map(phone_ids, &WhatsApp.get_phone_number!/1)
+        phone_template_map = build_phone_template_map(campaign, phone_ids, campaign.template_ids || [])
+        phone_template_ids = Map.get(phone_template_map, phone.id, [])
+        phone_mps_map = build_phone_mps_map(campaign, phone_ids)
+        phone_mps = Map.get(phone_mps_map, phone.id, 80)
+        weighted_map = build_weighted_phone_map(phones, phone_mps_map)
+        assignment_mode = assignment_mode?(campaign.id)
+
+        start_rate_limiter(phone, phone_mps)
+
+        weighted_indices = Map.get(weighted_map.phone_indices, phone.phone_number_id, [0])
+        total_slots = weighted_map.total_slots
+
+        buffer_name =
+          {:via, Registry, {TitanFlow.BufferRegistry, {campaign.id, phone.phone_number_id}}}
+
+        case GenServer.whereis(buffer_name) do
+          nil ->
+            DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
+              TitanFlow.Campaigns.BufferManager,
+              campaign_id: campaign.id,
+              phone_number_id: phone.phone_number_id,
+              weighted_indices: weighted_indices,
+              total_slots: total_slots,
+              assignment_mode: assignment_mode
+            })
+
+          _pid ->
+            :ok
+        end
+
+        stop_pipeline_for_phone(phone.phone_number_id, wait: true)
+
+        case start_pipeline_with_retry(campaign.id, phone.phone_number_id, phone_template_ids) do
+          {:ok, _pid} ->
+            {:ok, :restarted}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  @doc """
   Check if a campaign is paused.
   """
   def is_paused?(campaign_id) do
@@ -899,26 +1133,7 @@ defmodule TitanFlow.Campaigns.Orchestrator do
       end
     end
 
-    # Step 2: Clear ALL campaign Redis state (exhausted phones, failed templates)
-    keys = scan_keys("campaign:#{campaign_id}:*")
-
-    for key <- keys do
-      Redix.command(:redix, ["DEL", key])
-    end
-
-    Logger.info("Cleared #{length(keys)} Redis keys for campaign #{campaign_id}")
-
-    # Mark retry mode to prevent premature completion based on historical counts
-    _ =
-      Redix.command(:redix, [
-        "SET",
-        "campaign:#{campaign_id}:retry_mode",
-        "1",
-        "EX",
-        86_400
-      ])
-
-    # Step 3: Get phones with APPROVED templates only (and map approved templates per phone)
+    # Step 2: Get phones with APPROVED templates only (and map approved templates per phone)
     {valid_phone_ids, approved_templates_by_phone} =
       (campaign.senders_config || [])
       |> Enum.reduce({[], %{}}, fn config, {ids_acc, map_acc} ->
@@ -967,111 +1182,179 @@ defmodule TitanFlow.Campaigns.Orchestrator do
 
       {:error, :no_valid_phones}
     else
-      # Step 4: Start pipelines for valid phones only
-      # Use existing restart_pipelines logic but filter to valid phones
       phones = Enum.map(valid_phone_ids, &WhatsApp.get_phone_number!/1)
-
       phone_template_map = approved_templates_by_phone
 
-      phone_mps_map = build_phone_mps_map(campaign, valid_phone_ids)
+      Logger.info(
+        "Campaign #{campaign_id}: Running pre-flight verification for retry (#{length(phones)} phones)"
+      )
 
-      weighted_map = build_weighted_phone_map(phones, phone_mps_map)
+      verified_phones = verify_phones(campaign, phones, phone_template_map)
 
-      phones
-      |> Enum.each(fn phone ->
-        phone_template_ids = Map.get(phone_template_map, phone.id, [])
+      if Enum.empty?(verified_phones) do
+        error_msg = "Pre-flight failed: All selected numbers failed verification. Retry paused."
 
-        # Start RateLimiter
-        phone_mps = Map.get(phone_mps_map, phone.id, 80)
-        start_rate_limiter(phone, phone_mps)
+        Logger.warning("Campaign #{campaign_id}: #{error_msg}")
 
-        weighted_indices = Map.get(weighted_map.phone_indices, phone.phone_number_id, [0])
-        total_slots = weighted_map.total_slots
+        Campaigns.update_campaign(campaign, %{
+          status: "paused",
+          error_message: error_msg
+        })
 
-        # Start BufferManager in RETRY MODE (will fetch failed/unsent contacts)
-        buffer_name =
-          {:via, Registry, {TitanFlow.BufferRegistry, {campaign.id, phone.phone_number_id}}}
+        {:error, :preflight_failed}
+      else
+        if length(verified_phones) < length(phones) do
+          failed_phones = phones -- verified_phones
 
-        case GenServer.whereis(buffer_name) do
-          nil ->
-            DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
-              TitanFlow.Campaigns.BufferManager,
-              # Enable retry mode to fetch failed contacts
-              campaign_id: campaign.id,
-              phone_number_id: phone.phone_number_id,
-              weighted_indices: weighted_indices,
-              total_slots: total_slots,
-              retry_mode: true
-            })
-
-          _pid ->
-            # Restart to ensure retry_mode is enabled and cursor resets
-            stop_buffer_manager_for_phone(campaign.id, phone.phone_number_id)
-
-            DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
-              TitanFlow.Campaigns.BufferManager,
-              campaign_id: campaign.id,
-              phone_number_id: phone.phone_number_id,
-              weighted_indices: weighted_indices,
-              total_slots: total_slots,
-              retry_mode: true
-            })
+          Logger.warning(
+            "Campaign #{campaign_id}: #{length(failed_phones)} phones failed pre-flight: #{inspect(Enum.map(failed_phones, & &1.id))}"
+          )
         end
 
-        # Start Pipeline (restart if an old pipeline is already registered for this phone)
-        case Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone.phone_number_id) do
-          [] ->
-            pipeline_spec = %{
-              id: {:pipeline, phone.phone_number_id},
-              start:
-                {Pipeline, :start_link,
-                 [
-                   [
-                     phone_number_id: phone.phone_number_id,
-                     campaign_id: campaign.id,
-                     template_ids: phone_template_ids
-                   ]
-                 ]},
-              restart: :permanent
-            }
+        # Step 3: Clear ALL campaign Redis state (exhausted phones, failed templates)
+        keys = scan_keys("campaign:#{campaign_id}:*")
 
-            DynamicSupervisor.start_child(TitanFlow.Campaigns.PipelineSupervisor, pipeline_spec)
-
-          _ ->
-            stop_pipeline_for_phone(phone.phone_number_id)
-
-            pipeline_spec = %{
-              id: {:pipeline, phone.phone_number_id},
-              start:
-                {Pipeline, :start_link,
-                 [
-                   [
-                     phone_number_id: phone.phone_number_id,
-                     campaign_id: campaign.id,
-                     template_ids: phone_template_ids
-                   ]
-                 ]},
-              restart: :permanent
-            }
-
-            DynamicSupervisor.start_child(TitanFlow.Campaigns.PipelineSupervisor, pipeline_spec)
+        for key <- keys do
+          Redix.command(:redix, ["DEL", key])
         end
-      end)
 
-      Logger.info("Campaign #{campaign_id} retry started with #{length(valid_phone_ids)} phones")
+        Logger.info("Cleared #{length(keys)} Redis keys for campaign #{campaign_id}")
 
-      # Step 5: Update campaign status to running (after pipelines/buffers started)
-      # IMPORTANT: Reset failed_count so count-based completion doesn't trigger immediately
-      # The failed count will be rebuilt as retried messages are processed
-      Campaigns.update_campaign(campaign, %{
-        status: "running",
-        error_message: nil,
-        completed_at: nil,
-        # Reset for retry
-        failed_count: 0
-      })
+        # Mark retry mode to prevent premature completion based on historical counts
+        _ =
+          Redix.command(:redix, [
+            "SET",
+            "campaign:#{campaign_id}:retry_mode",
+            "1",
+            "EX",
+            86_400
+          ])
 
-      {:ok, :retry_started}
+        # Ensure contact status buffer is flushed before retry assignment
+        try do
+          TitanFlow.Campaigns.LogBatcher.flush_contact_status_now()
+        rescue
+          _ -> :ok
+        end
+
+        case ensure_contact_status_backfilled(campaign.id) do
+          :ok ->
+            phone_mps_map = build_phone_mps_map(campaign, valid_phone_ids)
+
+            case redistribute_retry_contacts(campaign.id, verified_phones, phone_mps_map, []) do
+              :ok ->
+                _ =
+                  Redix.command(:redix, ["SET", "campaign:#{campaign.id}:assignment_mode", "1"])
+
+                # Step 4: Start pipelines for verified phones only
+                weighted_map = build_weighted_phone_map(verified_phones, phone_mps_map)
+
+                verified_phones
+                |> Enum.each(fn phone ->
+                  phone_template_ids = Map.get(phone_template_map, phone.id, [])
+
+                  # Start RateLimiter
+                  phone_mps = Map.get(phone_mps_map, phone.id, 80)
+                  start_rate_limiter(phone, phone_mps)
+
+                  weighted_indices = Map.get(weighted_map.phone_indices, phone.phone_number_id, [0])
+                  total_slots = weighted_map.total_slots
+
+                  # Start BufferManager in RETRY MODE with assignments
+                  buffer_name =
+                    {:via, Registry,
+                     {TitanFlow.BufferRegistry, {campaign.id, phone.phone_number_id}}}
+
+                  case GenServer.whereis(buffer_name) do
+                    nil ->
+                      DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
+                        TitanFlow.Campaigns.BufferManager,
+                        campaign_id: campaign.id,
+                        phone_number_id: phone.phone_number_id,
+                        weighted_indices: weighted_indices,
+                        total_slots: total_slots,
+                        assignment_mode: true,
+                        retry_mode: true
+                      })
+
+                    _pid ->
+                      stop_buffer_manager_for_phone(campaign.id, phone.phone_number_id)
+
+                      DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
+                        TitanFlow.Campaigns.BufferManager,
+                        campaign_id: campaign.id,
+                        phone_number_id: phone.phone_number_id,
+                        weighted_indices: weighted_indices,
+                        total_slots: total_slots,
+                        assignment_mode: true,
+                        retry_mode: true
+                      })
+                  end
+
+                  # Start Pipeline (restart if an old pipeline is already registered for this phone)
+                  stop_pipeline_for_phone(phone.phone_number_id, wait: true)
+
+                  case start_pipeline_with_retry(
+                         campaign.id,
+                         phone.phone_number_id,
+                         phone_template_ids
+                       ) do
+                    {:ok, _pid} ->
+                      :ok
+
+                    {:error, reason} ->
+                      Logger.error(
+                        "Campaign #{campaign.id}: Failed to restart pipeline: #{inspect(reason)}"
+                      )
+                  end
+                end)
+
+                Logger.info(
+                  "Campaign #{campaign_id} retry started with #{length(verified_phones)} phones"
+                )
+
+                # Step 5: Update campaign status to running (after pipelines/buffers started)
+                Campaigns.update_campaign(campaign, %{
+                  status: "running",
+                  error_message: nil,
+                  completed_at: nil,
+                  failed_count: 0
+                })
+
+                {:ok, :retry_started}
+
+              {:error, reason} ->
+                Logger.error(
+                  "Campaign #{campaign_id}: Retry assignment failed: #{inspect(reason)}"
+                )
+
+                Campaigns.update_campaign(campaign, %{
+                  status: "paused",
+                  error_message: "Retry assignment failed. Please try again."
+                })
+
+                _ = Redix.command(:redix, ["DEL", "campaign:#{campaign.id}:assignment_mode"])
+                _ = Redix.command(:redix, ["DEL", "campaign:#{campaign.id}:retry_mode"])
+
+                {:error, reason}
+            end
+
+          {:error, reason} ->
+            Logger.error(
+              "Campaign #{campaign.id}: Contact status backfill failed: #{inspect(reason)}"
+            )
+
+            Campaigns.update_campaign(campaign, %{
+              status: "paused",
+              error_message: "Retry preparation failed. Please try again."
+            })
+
+            _ = Redix.command(:redix, ["DEL", "campaign:#{campaign.id}:retry_mode"])
+            _ = Redix.command(:redix, ["DEL", "campaign:#{campaign.id}:assignment_mode"])
+
+            {:error, reason}
+        end
+      end
     end
   end
 
@@ -1149,57 +1432,74 @@ defmodule TitanFlow.Campaigns.Orchestrator do
         phones = Enum.map(valid_phone_ids, &WhatsApp.get_phone_number!/1)
         phone_template_map = approved_templates_by_phone
         phone_mps_map = build_phone_mps_map(campaign, valid_phone_ids)
-        weighted_map = build_weighted_phone_map(phones, phone_mps_map)
+        queued_ids = queued_contact_ids(campaign_id, phones)
 
-        for phone <- phones do
-          weighted_indices = Map.get(weighted_map.phone_indices, phone.phone_number_id, [0])
-          total_slots = weighted_map.total_slots
+        case redistribute_retry_contacts(campaign_id, phones, phone_mps_map, queued_ids) do
+          :ok ->
+            _ = Redix.command(:redix, ["SET", "campaign:#{campaign_id}:assignment_mode", "1"])
+            weighted_map = build_weighted_phone_map(phones, phone_mps_map)
 
-          stop_buffer_manager_for_phone(campaign.id, phone.phone_number_id)
+            for phone <- phones do
+              weighted_indices = Map.get(weighted_map.phone_indices, phone.phone_number_id, [0])
+              total_slots = weighted_map.total_slots
 
-          DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
-            TitanFlow.Campaigns.BufferManager,
-            campaign_id: campaign.id,
-            phone_number_id: phone.phone_number_id,
-            weighted_indices: weighted_indices,
-            total_slots: total_slots,
-            retry_mode: true
-          })
+              stop_buffer_manager_for_phone(campaign.id, phone.phone_number_id)
 
-          case Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone.phone_number_id) do
-            [] ->
-              phone_template_ids = Map.get(phone_template_map, phone.id, [])
+              DynamicSupervisor.start_child(TitanFlow.BufferSupervisor, {
+                TitanFlow.Campaigns.BufferManager,
+                campaign_id: campaign.id,
+                phone_number_id: phone.phone_number_id,
+                weighted_indices: weighted_indices,
+                total_slots: total_slots,
+                assignment_mode: true,
+                retry_mode: true
+              })
 
-              pipeline_spec = %{
-                id: {:pipeline, phone.phone_number_id},
-                start:
-                  {Pipeline, :start_link,
-                   [
-                     [
-                       phone_number_id: phone.phone_number_id,
-                       campaign_id: campaign.id,
-                       template_ids: phone_template_ids
-                     ]
-                   ]},
-                restart: :permanent
-              }
+              case Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone.phone_number_id) do
+                [] ->
+                  phone_template_ids = Map.get(phone_template_map, phone.id, [])
 
-              DynamicSupervisor.start_child(TitanFlow.Campaigns.PipelineSupervisor, pipeline_spec)
+                  pipeline_spec = %{
+                    id: {:pipeline, phone.phone_number_id},
+                    start:
+                      {Pipeline, :start_link,
+                       [
+                         [
+                           phone_number_id: phone.phone_number_id,
+                           campaign_id: campaign.id,
+                           template_ids: phone_template_ids
+                         ]
+                       ]},
+                    restart: :permanent
+                  }
 
-            _ ->
-              :ok
-          end
+                  DynamicSupervisor.start_child(
+                    TitanFlow.Campaigns.PipelineSupervisor,
+                    pipeline_spec
+                  )
+
+                _ ->
+                  :ok
+              end
+            end
+
+            for exhausted_phone_number_id <- MapSet.to_list(exhausted_numbers) do
+              stop_buffer_manager_for_phone(campaign.id, exhausted_phone_number_id)
+            end
+
+            Logger.info(
+              "Retry redistribution complete for campaign #{campaign_id} (active phones: #{length(valid_phone_ids)})"
+            )
+
+            :ok
+
+          {:error, reason} ->
+            Logger.error(
+              "Retry redistribution failed for campaign #{campaign_id}: #{inspect(reason)}"
+            )
+
+            :ok
         end
-
-        for exhausted_phone_number_id <- MapSet.to_list(exhausted_numbers) do
-          stop_buffer_manager_for_phone(campaign.id, exhausted_phone_number_id)
-        end
-
-        Logger.info(
-          "Retry redistribution complete for campaign #{campaign_id} (active phones: #{length(valid_phone_ids)})"
-        )
-
-        :ok
       end
     end
   end
@@ -1212,7 +1512,22 @@ defmodule TitanFlow.Campaigns.Orchestrator do
       |> Enum.map(fn config ->
         phone_id = config["phone_id"]
         tmpl_ids = config["template_ids"] || []
-        {phone_id, tmpl_ids}
+        approved_ids = filter_approved_template_ids(tmpl_ids)
+        skipped_count = length(tmpl_ids) - length(approved_ids)
+
+        if Enum.empty?(approved_ids) do
+          Logger.warning(
+            "Campaign #{campaign.id}: Phone #{phone_id} has no APPROVED templates configured"
+          )
+        else
+          if skipped_count > 0 do
+            Logger.info(
+              "Campaign #{campaign.id}: Phone #{phone_id} using approved templates #{inspect(approved_ids)} (skipped #{skipped_count} non-approved/missing)"
+            )
+          end
+        end
+
+        {phone_id, approved_ids}
       end)
       |> Map.new()
     else
@@ -1221,11 +1536,46 @@ defmodule TitanFlow.Campaigns.Orchestrator do
         "Campaign #{campaign.id}: Using legacy phone_ids/template_ids (no senders_config)"
       )
 
+      approved_ids = filter_approved_template_ids(template_ids)
+
+      if Enum.empty?(approved_ids) do
+        Logger.warning("Campaign #{campaign.id}: No APPROVED templates configured")
+      else
+        skipped_count = length(template_ids) - length(approved_ids)
+
+        if skipped_count > 0 do
+          Logger.info(
+            "Campaign #{campaign.id}: Using approved templates #{inspect(approved_ids)} (skipped #{skipped_count} non-approved/missing)"
+          )
+        end
+      end
+
       phone_ids
-      |> Enum.map(fn phone_id -> {phone_id, template_ids} end)
+      |> Enum.map(fn phone_id -> {phone_id, approved_ids} end)
       |> Map.new()
     end
   end
+
+  defp filter_approved_template_ids(template_ids) do
+    Enum.filter(template_ids, &template_approved?/1)
+  end
+
+  defp template_approved?(template_id) when is_integer(template_id) do
+    case TitanFlow.Templates.TemplateCache.get(template_id) do
+      {:ok, template} ->
+        template.status == "APPROVED"
+
+      _ ->
+        try do
+          template = TitanFlow.Templates.get_template!(template_id)
+          template.status == "APPROVED"
+        rescue
+          _ -> false
+        end
+    end
+  end
+
+  defp template_approved?(_), do: false
 
   defp build_phone_mps_map(campaign, phone_ids) do
     if campaign.senders_config && length(campaign.senders_config) > 0 do
@@ -1278,15 +1628,104 @@ defmodule TitanFlow.Campaigns.Orchestrator do
   end
 
   # Bug Fix #2: Helper functions to terminate children from supervisor
-  defp stop_pipeline_for_phone(phone_number_id) do
-    case Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone_number_id) do
-      [{pid, _}] ->
-        # Terminate the child from supervisor (prevents auto-restart)
-        DynamicSupervisor.terminate_child(TitanFlow.Campaigns.PipelineSupervisor, pid)
-        Logger.info("Pipeline for phone #{phone_number_id} terminated")
+  defp stop_pipeline_for_phone(phone_number_id, opts \\ []) do
+    wait? = Keyword.get(opts, :wait, false)
 
-      [] ->
+    terminated? =
+      case Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone_number_id) do
+        [{pid, _}] ->
+          # Terminate the child from supervisor (prevents auto-restart)
+          DynamicSupervisor.terminate_child(TitanFlow.Campaigns.PipelineSupervisor, pid)
+          Logger.info("Pipeline for phone #{phone_number_id} terminated")
+          true
+
+        [] ->
+          case pipeline_child_pid(phone_number_id) do
+            nil ->
+              false
+
+            pid ->
+              DynamicSupervisor.terminate_child(TitanFlow.Campaigns.PipelineSupervisor, pid)
+              Logger.info("Pipeline for phone #{phone_number_id} terminated (supervisor lookup)")
+              true
+          end
+      end
+
+    if wait? and terminated? do
+      _ = wait_for_pipeline_stop(phone_number_id, 2_000)
+    end
+
+    :ok
+  end
+
+  defp pipeline_child_pid(phone_number_id) do
+    try do
+      TitanFlow.Campaigns.PipelineSupervisor
+      |> DynamicSupervisor.which_children()
+      |> Enum.find_value(fn {id, pid, _type, _modules} ->
+        if id == {:pipeline, phone_number_id}, do: pid, else: nil
+      end)
+    catch
+      :exit, _ -> nil
+    end
+  end
+
+  defp wait_for_pipeline_stop(phone_number_id, timeout_ms) do
+    started_ms = System.monotonic_time(:millisecond)
+    do_wait_for_pipeline_stop(phone_number_id, started_ms, timeout_ms)
+  end
+
+  defp do_wait_for_pipeline_stop(phone_number_id, started_ms, timeout_ms) do
+    elapsed = System.monotonic_time(:millisecond) - started_ms
+
+    if elapsed > timeout_ms do
+      :timeout
+    else
+      running? =
+        Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone_number_id) != [] or
+          is_pid(pipeline_child_pid(phone_number_id))
+
+      if running? do
+        Process.sleep(50)
+        do_wait_for_pipeline_stop(phone_number_id, started_ms, timeout_ms)
+      else
         :ok
+      end
+    end
+  end
+
+  defp start_pipeline_with_retry(campaign_id, phone_number_id, template_ids, attempts \\ 3)
+
+  defp start_pipeline_with_retry(_campaign_id, _phone_number_id, _template_ids, attempts)
+       when attempts <= 0 do
+    {:error, :start_attempts_exhausted}
+  end
+
+  defp start_pipeline_with_retry(campaign_id, phone_number_id, template_ids, attempts) do
+    pipeline_spec = %{
+      id: {:pipeline, phone_number_id},
+      start:
+        {Pipeline, :start_link,
+         [
+           [
+             phone_number_id: phone_number_id,
+             campaign_id: campaign_id,
+             template_ids: template_ids
+           ]
+         ]},
+      restart: :permanent
+    }
+
+    case DynamicSupervisor.start_child(TitanFlow.Campaigns.PipelineSupervisor, pipeline_spec) do
+      {:ok, pid} ->
+        {:ok, pid}
+
+      {:error, {:already_started, _pid}} ->
+        _ = wait_for_pipeline_stop(phone_number_id, 1_000)
+        start_pipeline_with_retry(campaign_id, phone_number_id, template_ids, attempts - 1)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1328,6 +1767,7 @@ defmodule TitanFlow.Campaigns.Orchestrator do
 
           {:ok, {:error, phone, reason}} ->
             Logger.warning("Pre-flight FAILED immediately for phone #{phone.id}: #{reason}")
+            record_preflight_error(campaign.id, phone.phone_number_id, reason)
             acc
 
           {:exit, reason} ->
@@ -1358,12 +1798,14 @@ defmodule TitanFlow.Campaigns.Orchestrator do
 
               {:error, reason} ->
                 Logger.warning("Pre-flight FAILED (webhook) for phone #{phone.id}: #{reason}")
+                record_preflight_error(campaign.id, phone.phone_number_id, reason)
                 false
             end
           end)
 
         if passed do
           Logger.info("Pre-flight PASSED for phone #{phone.id} (#{phone.phone_number_id})")
+          clear_preflight_error(campaign.id, phone.phone_number_id)
         end
 
         passed
@@ -1434,6 +1876,18 @@ defmodule TitanFlow.Campaigns.Orchestrator do
         {:error, _phone, _reason} = error -> error
       end
     end
+  end
+
+  defp record_preflight_error(campaign_id, phone_number_id, reason) do
+    key = "campaign:#{campaign_id}:phone:#{phone_number_id}:preflight_error"
+    _ = Redix.command(:redix, ["SET", key, to_string(reason), "EX", 86_400])
+    :ok
+  end
+
+  defp clear_preflight_error(campaign_id, phone_number_id) do
+    key = "campaign:#{campaign_id}:phone:#{phone_number_id}:preflight_error"
+    _ = Redix.command(:redix, ["DEL", key])
+    :ok
   end
 
   defp scan_keys(pattern, count \\ 1000) do

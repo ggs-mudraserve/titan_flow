@@ -4,11 +4,13 @@ defmodule TitanFlow.Templates do
   """
 
   import Ecto.Query
+  alias TitanFlow.Campaigns.Cache
   alias TitanFlow.Repo
   alias TitanFlow.Templates.Template
   alias TitanFlow.WhatsApp
 
   require Logger
+  alias TitanFlow.Http
 
   # Template CRUD
 
@@ -154,6 +156,12 @@ defmodule TitanFlow.Templates do
         |> Enum.map(&sync_templates_for_waba/1)
         |> Enum.sum()
 
+      try do
+        TitanFlow.Templates.TemplateCache.refresh()
+      rescue
+        _ -> :ok
+      end
+
       {:ok, total}
     end
   end
@@ -161,7 +169,7 @@ defmodule TitanFlow.Templates do
   def sync_templates_for_waba(phone_number) do
     url = "https://graph.facebook.com/v21.0/#{phone_number.waba_id}/message_templates"
 
-    case Req.get(url,
+    case Http.get(url,
            headers: [{"Authorization", "Bearer #{phone_number.access_token}"}],
            params: [limit: 250]
          ) do
@@ -269,6 +277,10 @@ defmodule TitanFlow.Templates do
               )
           end
       end
+
+      if status == "APPROVED" and meta_template["category"] == "UTILITY" do
+        Cache.clear_template_paused(meta_template["name"])
+      end
     end
   end
 
@@ -285,9 +297,10 @@ defmodule TitanFlow.Templates do
       components: components
     }
 
-    case Req.post(url,
+    case Http.post(url,
            json: payload,
-           headers: [{"Authorization", "Bearer #{access_token}"}]
+           headers: [{"Authorization", "Bearer #{access_token}"}],
+           connect_options: [protocols: [:http1]]
          ) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         # Save the new template locally

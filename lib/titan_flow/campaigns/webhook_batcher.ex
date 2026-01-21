@@ -24,6 +24,7 @@ defmodule TitanFlow.Campaigns.WebhookBatcher do
   @buffer_key "buffer:webhook_updates"
   # Drop updates older than 30s
   @requeue_ttl_ms 30_000
+  @template_retry_queue "queue:template_retry"
 
   # Status priority (higher = more final)
   @status_priority %{
@@ -239,7 +240,7 @@ defmodule TitanFlow.Campaigns.WebhookBatcher do
   # Fetch existing logs with campaign_id and phone_number_id for error triggers
   defp fetch_existing_logs(message_ids) do
     sql = """
-    SELECT meta_message_id, id, campaign_id, phone_number_id, recipient_phone, template_name, status
+    SELECT meta_message_id, id, campaign_id, phone_number_id, recipient_phone, template_name, status, contact_id
     FROM message_logs
     WHERE meta_message_id = ANY($1)
     """
@@ -270,16 +271,16 @@ defmodule TitanFlow.Campaigns.WebhookBatcher do
     {failed_updates, sent_updates} = Enum.split_with(remaining, &(&1.status == "failed"))
 
     # Apply each type of update
-    apply_delivered_batch(delivered_updates)
-    apply_read_batch(read_updates)
-    apply_sent_batch(sent_updates)
+    apply_delivered_batch(delivered_updates, log_lookup)
+    apply_read_batch(read_updates, log_lookup)
+    apply_sent_batch(sent_updates, log_lookup)
     apply_failed_batch(failed_updates, log_lookup)
   end
 
   # FIX #2: Set delivered_at for delivered status
-  defp apply_delivered_batch([]), do: :ok
+  defp apply_delivered_batch([], _log_lookup), do: :ok
 
-  defp apply_delivered_batch(updates) do
+  defp apply_delivered_batch(updates, log_lookup) do
     sql = """
     UPDATE message_logs
     SET status = 'delivered',
@@ -288,14 +289,18 @@ defmodule TitanFlow.Campaigns.WebhookBatcher do
     FROM (SELECT unnest($1::text[]) as mid, unnest($2::timestamptz[]) as ts) v
     WHERE message_logs.meta_message_id = v.mid
       AND message_logs.status IN ('sent')
+    RETURNING message_logs.meta_message_id
     """
 
     ids = Enum.map(updates, & &1.meta_message_id)
     timestamps = Enum.map(updates, fn u -> u.timestamp || DateTime.utc_now() end)
 
     case Repo.query(sql, [ids, timestamps]) do
-      {:ok, %{num_rows: n}} ->
-        if n > 0, do: Logger.debug("WebhookBatcher: Updated #{n} to delivered")
+      {:ok, %{rows: rows, num_rows: n}} ->
+        if n > 0 do
+          Logger.debug("WebhookBatcher: Updated #{n} to delivered")
+          buffer_contact_status_for_ids(rows, log_lookup, "delivered")
+        end
 
       {:error, reason} ->
         Logger.error("WebhookBatcher: Delivered batch failed: #{inspect(reason)}")
@@ -303,9 +308,9 @@ defmodule TitanFlow.Campaigns.WebhookBatcher do
   end
 
   # FIX #2: Set read_at for read status
-  defp apply_read_batch([]), do: :ok
+  defp apply_read_batch([], _log_lookup), do: :ok
 
-  defp apply_read_batch(updates) do
+  defp apply_read_batch(updates, log_lookup) do
     sql = """
     UPDATE message_logs
     SET status = 'read',
@@ -314,23 +319,27 @@ defmodule TitanFlow.Campaigns.WebhookBatcher do
     FROM (SELECT unnest($1::text[]) as mid, unnest($2::timestamptz[]) as ts) v
     WHERE message_logs.meta_message_id = v.mid
       AND message_logs.status IN ('sent', 'delivered')
+    RETURNING message_logs.meta_message_id
     """
 
     ids = Enum.map(updates, & &1.meta_message_id)
     timestamps = Enum.map(updates, fn u -> u.timestamp || DateTime.utc_now() end)
 
     case Repo.query(sql, [ids, timestamps]) do
-      {:ok, %{num_rows: n}} ->
-        if n > 0, do: Logger.debug("WebhookBatcher: Updated #{n} to read")
+      {:ok, %{rows: rows, num_rows: n}} ->
+        if n > 0 do
+          Logger.debug("WebhookBatcher: Updated #{n} to read")
+          buffer_contact_status_for_ids(rows, log_lookup, "read")
+        end
 
       {:error, reason} ->
         Logger.error("WebhookBatcher: Read batch failed: #{inspect(reason)}")
     end
   end
 
-  defp apply_sent_batch([]), do: :ok
+  defp apply_sent_batch([], _log_lookup), do: :ok
 
-  defp apply_sent_batch(updates) do
+  defp apply_sent_batch(updates, log_lookup) do
     # Sent status rarely comes from webhooks (usually set by LogBatcher)
     # But handle it for completeness
     sql = """
@@ -339,10 +348,21 @@ defmodule TitanFlow.Campaigns.WebhookBatcher do
     FROM (SELECT unnest($1::text[]) as mid) v
     WHERE message_logs.meta_message_id = v.mid
       AND message_logs.status IS NULL
+    RETURNING message_logs.meta_message_id
     """
 
     ids = Enum.map(updates, & &1.meta_message_id)
-    Repo.query(sql, [ids])
+
+    case Repo.query(sql, [ids]) do
+      {:ok, %{rows: rows, num_rows: n}} ->
+        if n > 0 do
+          Logger.debug("WebhookBatcher: Updated #{n} to sent")
+          buffer_contact_status_for_ids(rows, log_lookup, "sent")
+        end
+
+      {:error, reason} ->
+        Logger.error("WebhookBatcher: Sent batch failed: #{inspect(reason)}")
+    end
   end
 
   # FIX #3: Handle failed with error triggers
@@ -376,28 +396,87 @@ defmodule TitanFlow.Campaigns.WebhookBatcher do
         end
 
         # FIX #3: Call error triggers for each failed update
-        Enum.each(updates, fn update ->
-          if update.meta_message_id in updated_ids do
-            case Map.get(log_lookup, update.meta_message_id) do
-              nil ->
+        updated_set = MapSet.new(updated_ids)
+
+        retry_jobs =
+          Enum.reduce(updates, [], fn update, acc ->
+            if update.meta_message_id in updated_set do
+              case Map.get(log_lookup, update.meta_message_id) do
+                nil ->
+                  acc
+
+                log ->
+                  # Call error triggers (blacklist, rotation, template tracking)
+                  MessageTracking.handle_webhook_error(
+                    log.campaign_id,
+                    log.phone_number_id,
+                    update.error_code,
+                    log.recipient_phone,
+                    log.template_name
+                  )
+
+                  if log.contact_id do
+                    MessageTracking.buffer_contact_status(
+                      log.campaign_id,
+                      log.contact_id,
+                      "failed",
+                      update.error_code
+                    )
+                  end
+
+                  if update.error_code do
+                    [
+                      Jason.encode!(%{
+                        "meta_message_id" => log.meta_message_id,
+                        "campaign_id" => log.campaign_id,
+                        "phone_number_id" => log.phone_number_id,
+                        "recipient_phone" => log.recipient_phone,
+                        "template_name" => log.template_name,
+                        "contact_id" => log.contact_id,
+                        "error_code" => update.error_code
+                      })
+                      | acc
+                    ]
+                  else
+                    acc
+                  end
+              end
+            else
+              acc
+            end
+          end)
+
+        case Enum.reverse(retry_jobs) do
+          [] ->
+            :ok
+
+          jobs ->
+            case Redix.command(:redix, ["RPUSH", @template_retry_queue | jobs]) do
+              {:ok, _} ->
                 :ok
 
-              log ->
-                # Call error triggers (blacklist, rotation, template tracking)
-                MessageTracking.handle_webhook_error(
-                  log.campaign_id,
-                  log.phone_number_id,
-                  update.error_code,
-                  log.recipient_phone,
-                  log.template_name
-                )
+              {:error, reason} ->
+                Logger.error("WebhookBatcher: Retry queue push failed: #{inspect(reason)}")
             end
-          end
-        end)
+        end
 
       {:error, reason} ->
         Logger.error("WebhookBatcher: Failed batch failed: #{inspect(reason)}")
     end
+  end
+
+  defp buffer_contact_status_for_ids(rows, log_lookup, status) do
+    rows
+    |> Enum.map(fn [mid] -> mid end)
+    |> Enum.each(fn mid ->
+      case Map.get(log_lookup, mid) do
+        %{campaign_id: campaign_id, contact_id: contact_id} when not is_nil(contact_id) ->
+          MessageTracking.buffer_contact_status(campaign_id, contact_id, status)
+
+        _ ->
+          :ok
+      end
+    end)
   end
 
   # FIX #4: Proper requeue with TTL check

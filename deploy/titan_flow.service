@@ -1,7 +1,7 @@
 [Unit]
 Description=TitanFlow WhatsApp Campaign Server
 Documentation=https://github.com/your-org/titan_flow
-After=network.target postgresql.service redis.service
+After=network.target docker.service postgresql.service redis.service
 StartLimitIntervalSec=60
 StartLimitBurst=3
 

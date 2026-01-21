@@ -20,8 +20,8 @@ defmodule TitanFlow.Campaigns.BufferManager do
   # Configuration
   @max_buffer 20_000
   @refill_threshold 5_000
-  @batch_size 10_000
-  @check_interval_ms 5_000
+  @batch_size 5_000
+  @check_interval_ms 7_000
 
   # Client API
 
@@ -157,66 +157,52 @@ defmodule TitanFlow.Campaigns.BufferManager do
     if fetch_count <= 0 do
       state
     else
-      {contacts, state} =
-        if state.retry_mode do
-          fetch_retry_contacts(state, fetch_count)
-        else
+      if state.retry_mode do
+        if state.assignment_mode do
           contacts =
-            if state.assignment_mode do
-              fetch_assigned_contacts(
-                state.campaign_id,
-                state.phone_number_id,
-                state.last_contact_id,
-                fetch_count
-              )
-            else
-              fetch_unsent_contacts(
-                state.campaign_id,
-                state.last_contact_id,
-                fetch_count,
-                state.weighted_indices,
-                state.total_slots,
-                state.retry_mode
-              )
-            end
+            fetch_assigned_contacts(
+              state.campaign_id,
+              state.phone_number_id,
+              state.last_contact_id,
+              fetch_count,
+              retry_mode: true
+            )
 
-          {contacts, state}
-        end
-
-      if Enum.empty?(contacts) do
-        Logger.info(
-          "BufferManager: No more contacts for campaign #{state.campaign_id}, marking exhausted"
-        )
-
-        Task.start(fn ->
-          TitanFlow.Campaigns.Orchestrator.maybe_redistribute_on_exhaustion(state.campaign_id)
-        end)
-
-        # Trigger completion check asynchronously (don't block BufferManager)
-        Task.start(fn ->
-          # Small delay to ensure last messages are sent
-          Process.sleep(5000)
-          TitanFlow.Campaigns.MessageTracking.check_campaign_completion(state.campaign_id)
-        end)
-
-        %{state | is_exhausted: true}
-      else
-        # Push to Redis
-        pushed = push_to_redis(contacts, state.phone_number_id, state.campaign_id)
-
-        if state.retry_mode do
-          Logger.info(
-            "BufferManager: Pushed #{pushed} contacts (retry) failed_cursor=#{state.last_failed_id} nolog_cursor=#{state.last_nolog_id}"
-          )
-
-          %{state | total_pushed: state.total_pushed + pushed}
+          handle_contacts_or_exhausted(contacts, state)
         else
-          new_last_id = contacts |> List.last() |> Map.get(:id)
+          case fetch_retry_contacts(state, fetch_count) do
+            {:ok, contacts, state} ->
+              handle_contacts_or_exhausted(contacts, state)
 
-          Logger.info("BufferManager: Pushed #{pushed} contacts, cursor now at #{new_last_id}")
+            {:error, reason, state} ->
+              Logger.error(
+                "BufferManager: Retry fetch failed for campaign #{state.campaign_id}: #{inspect(reason)}"
+              )
 
-          %{state | last_contact_id: new_last_id, total_pushed: state.total_pushed + pushed}
+              state
+          end
         end
+      else
+        contacts =
+          if state.assignment_mode do
+            fetch_assigned_contacts(
+              state.campaign_id,
+              state.phone_number_id,
+              state.last_contact_id,
+              fetch_count
+            )
+          else
+            fetch_unsent_contacts(
+              state.campaign_id,
+              state.last_contact_id,
+              fetch_count,
+              state.weighted_indices,
+              state.total_slots,
+              state.retry_mode
+            )
+          end
+
+        handle_contacts_or_exhausted(contacts, state)
       end
     end
   end
@@ -233,13 +219,16 @@ defmodule TitanFlow.Campaigns.BufferManager do
        ) do
     query =
       from c in "contacts",
-        left_join: m in "message_logs",
-        on: m.contact_id == c.id and m.campaign_id == c.campaign_id,
         where: c.campaign_id == ^campaign_id,
         where: c.id > ^after_id,
         where: c.is_blacklisted == false,
         # Only contacts with NO message_log
-        where: is_nil(m.id),
+        where:
+          fragment(
+            "NOT EXISTS (SELECT 1 FROM message_logs m WHERE m.contact_id = ? AND m.campaign_id = ?)",
+            c.id,
+            c.campaign_id
+          ),
         # WEIGHTED MODULO: Contact assigned to this phone if rem(id, total) IN indices
         where: fragment("? % ? = ANY(?)", c.id, ^total_slots, ^weighted_indices),
         order_by: [asc: c.id],
@@ -254,19 +243,35 @@ defmodule TitanFlow.Campaigns.BufferManager do
     Repo.all(query)
   end
 
-  defp fetch_assigned_contacts(campaign_id, phone_number_id, after_id, limit) do
-    query =
+  defp fetch_assigned_contacts(campaign_id, phone_number_id, after_id, limit, opts \\ []) do
+    skip_message_logs =
+      Keyword.get(opts, :skip_message_logs, false) or Keyword.get(opts, :retry_mode, false)
+
+    base_query =
       from c in "contacts",
         join: a in "contact_assignments",
         on:
           a.contact_id == c.id and a.campaign_id == ^campaign_id and
             a.phone_number_id == ^phone_number_id,
-        left_join: m in "message_logs",
-        on: m.contact_id == c.id and m.campaign_id == c.campaign_id,
         where: c.campaign_id == ^campaign_id,
         where: c.id > ^after_id,
-        where: c.is_blacklisted == false,
-        where: is_nil(m.id),
+        where: c.is_blacklisted == false
+
+    query =
+      if skip_message_logs do
+        base_query
+      else
+        from c in base_query,
+          where:
+            fragment(
+              "NOT EXISTS (SELECT 1 FROM message_logs m WHERE m.contact_id = ? AND m.campaign_id = ?)",
+              c.id,
+              c.campaign_id
+            )
+      end
+
+    query =
+      from c in query,
         order_by: [asc: c.id],
         limit: ^limit,
         select: %{
@@ -283,98 +288,112 @@ defmodule TitanFlow.Campaigns.BufferManager do
     failed_limit = div(limit, 2)
     nolog_limit = limit - failed_limit
 
-    failed_contacts =
-      fetch_retry_failed_contacts(
-        state.campaign_id,
-        state.last_failed_id,
-        failed_limit,
-        state.weighted_indices,
-        state.total_slots
-      )
+    with {:ok, failed_contacts} <-
+           fetch_retry_failed_contacts(
+             state.campaign_id,
+             state.last_failed_id,
+             failed_limit,
+             state.weighted_indices,
+             state.total_slots
+           ),
+         {:ok, nolog_contacts} <-
+           fetch_retry_nolog_contacts(
+             state.campaign_id,
+             state.last_nolog_id,
+             nolog_limit,
+             state.weighted_indices,
+             state.total_slots
+           ) do
+      new_last_failed_id = last_contact_id_or(state.last_failed_id, failed_contacts)
+      new_last_nolog_id = last_contact_id_or(state.last_nolog_id, nolog_contacts)
 
-    nolog_contacts =
-      fetch_retry_nolog_contacts(
-        state.campaign_id,
-        state.last_nolog_id,
-        nolog_limit,
-        state.weighted_indices,
-        state.total_slots
-      )
+      contacts = interleave_contacts(failed_contacts, nolog_contacts)
+      remaining = limit - length(contacts)
 
-    new_last_failed_id = last_contact_id_or(state.last_failed_id, failed_contacts)
-    new_last_nolog_id = last_contact_id_or(state.last_nolog_id, nolog_contacts)
+      result =
+        cond do
+          remaining > 0 and length(failed_contacts) < failed_limit ->
+            case fetch_retry_nolog_contacts(
+                   state.campaign_id,
+                   new_last_nolog_id,
+                   remaining,
+                   state.weighted_indices,
+                   state.total_slots
+                 ) do
+              {:ok, extra} ->
+                new_last_nolog_id = last_contact_id_or(new_last_nolog_id, extra)
+                {:ok, contacts ++ extra, new_last_failed_id, new_last_nolog_id}
 
-    contacts = interleave_contacts(failed_contacts, nolog_contacts)
-    remaining = limit - length(contacts)
+              {:error, reason} ->
+                {:error, reason}
+            end
 
-    {contacts, new_last_failed_id, new_last_nolog_id} =
-      cond do
-        remaining > 0 and length(failed_contacts) < failed_limit ->
-          extra =
-            fetch_retry_nolog_contacts(
-              state.campaign_id,
-              new_last_nolog_id,
-              remaining,
-              state.weighted_indices,
-              state.total_slots
-            )
+          remaining > 0 and length(nolog_contacts) < nolog_limit ->
+            case fetch_retry_failed_contacts(
+                   state.campaign_id,
+                   new_last_failed_id,
+                   remaining,
+                   state.weighted_indices,
+                   state.total_slots
+                 ) do
+              {:ok, extra} ->
+                new_last_failed_id = last_contact_id_or(new_last_failed_id, extra)
+                {:ok, contacts ++ extra, new_last_failed_id, new_last_nolog_id}
 
-          new_last_nolog_id = last_contact_id_or(new_last_nolog_id, extra)
-          {contacts ++ extra, new_last_failed_id, new_last_nolog_id}
+              {:error, reason} ->
+                {:error, reason}
+            end
 
-        remaining > 0 and length(nolog_contacts) < nolog_limit ->
-          extra =
-            fetch_retry_failed_contacts(
-              state.campaign_id,
-              new_last_failed_id,
-              remaining,
-              state.weighted_indices,
-              state.total_slots
-            )
+          true ->
+            {:ok, contacts, new_last_failed_id, new_last_nolog_id}
+        end
 
-          new_last_failed_id = last_contact_id_or(new_last_failed_id, extra)
-          {contacts ++ extra, new_last_failed_id, new_last_nolog_id}
+      case result do
+        {:error, reason} ->
+          {:error, reason, state}
 
-        true ->
-          {contacts, new_last_failed_id, new_last_nolog_id}
+        {:ok, contacts, new_last_failed_id, new_last_nolog_id} ->
+          {:ok, contacts,
+           %{
+             state
+             | last_failed_id: new_last_failed_id,
+               last_nolog_id: new_last_nolog_id
+           }}
       end
-
-    {contacts,
-     %{
-       state
-       | last_failed_id: new_last_failed_id,
-         last_nolog_id: new_last_nolog_id
-     }}
+    else
+      {:error, reason} ->
+        {:error, reason, state}
+    end
   end
 
   defp fetch_retry_failed_contacts(campaign_id, after_id, limit, weighted_indices, total_slots)
        when limit > 0 do
     sql = """
+    WITH latest AS MATERIALIZED (
+      SELECT DISTINCT ON (m.contact_id) m.contact_id, m.status, m.error_code
+      FROM message_logs m
+      WHERE m.campaign_id = $1
+        AND m.contact_id > $2
+        AND m.contact_id % $3 = ANY($4::int[])
+      ORDER BY m.contact_id, m.inserted_at DESC
+    ),
+    success AS MATERIALIZED (
+      SELECT DISTINCT m.contact_id
+      FROM message_logs m
+      WHERE m.campaign_id = $1
+        AND m.contact_id > $2
+        AND m.contact_id % $3 = ANY($4::int[])
+        AND m.status IN ('sent', 'delivered', 'read')
+    )
     SELECT c.id, c.phone, c.name, c.variables
-    FROM contacts c
+    FROM latest l
+    JOIN contacts c ON c.id = l.contact_id
     WHERE c.campaign_id = $1
       AND c.id > $2
       AND c.is_blacklisted = false
-      AND c.id % $3 = ANY($4::int[])
-      -- Exclude contacts with any successful send
-      AND NOT EXISTS (
-        SELECT 1 FROM message_logs m
-        WHERE m.contact_id = c.id
-          AND m.campaign_id = c.campaign_id
-          AND m.status IN ('sent', 'delivered', 'read')
-      )
-      -- Include only contacts whose latest log is a retryable failure
-      AND EXISTS (
-        SELECT 1 FROM message_logs m
-        WHERE m.contact_id = c.id
-          AND m.campaign_id = c.campaign_id
-          AND m.status = 'failed'
-          AND (m.error_code IN ('131042', '131048', '130429', 'PHONE_EXHAUSTED') OR m.error_code LIKE '132%')
-          AND m.inserted_at = (
-            SELECT MAX(m2.inserted_at) FROM message_logs m2
-            WHERE m2.contact_id = c.id AND m2.campaign_id = c.campaign_id
-          )
-      )
+      AND l.status = 'failed'
+      AND (l.error_code IN ('131042', '131048', '130429', 'PHONE_EXHAUSTED') OR l.error_code LIKE '132%')
+      AND l.contact_id NOT IN (SELECT contact_id FROM success)
     ORDER BY c.id ASC
     LIMIT $5
     """
@@ -383,21 +402,25 @@ defmodule TitanFlow.Campaigns.BufferManager do
   end
 
   defp fetch_retry_failed_contacts(_campaign_id, _after_id, 0, _weighted_indices, _total_slots),
-    do: []
+    do: {:ok, []}
 
   defp fetch_retry_nolog_contacts(campaign_id, after_id, limit, weighted_indices, total_slots)
        when limit > 0 do
     sql = """
+    WITH logged AS MATERIALIZED (
+      SELECT DISTINCT m.contact_id
+      FROM message_logs m
+      WHERE m.campaign_id = $1
+        AND m.contact_id > $2
+        AND m.contact_id % $3 = ANY($4::int[])
+    )
     SELECT c.id, c.phone, c.name, c.variables
     FROM contacts c
     WHERE c.campaign_id = $1
       AND c.id > $2
       AND c.is_blacklisted = false
       AND c.id % $3 = ANY($4::int[])
-      -- Include only contacts with no logs at all
-      AND NOT EXISTS (
-        SELECT 1 FROM message_logs m WHERE m.contact_id = c.id AND m.campaign_id = c.campaign_id
-      )
+      AND c.id NOT IN (SELECT contact_id FROM logged)
     ORDER BY c.id ASC
     LIMIT $5
     """
@@ -406,21 +429,22 @@ defmodule TitanFlow.Campaigns.BufferManager do
   end
 
   defp fetch_retry_nolog_contacts(_campaign_id, _after_id, 0, _weighted_indices, _total_slots),
-    do: []
+    do: {:ok, []}
 
   defp run_retry_query(sql, params) do
     case Repo.query(sql, params) do
       {:ok, %{rows: rows, columns: columns}} ->
-        Enum.map(rows, fn row ->
-          columns
-          |> Enum.zip(row)
-          |> Enum.into(%{}, fn {col, val} -> {String.to_atom(col), val} end)
-        end)
+        results =
+          Enum.map(rows, fn row ->
+            columns
+            |> Enum.zip(row)
+            |> Enum.into(%{}, fn {col, val} -> {String.to_atom(col), val} end)
+          end)
+
+        {:ok, results}
 
       {:error, reason} ->
-        require Logger
-        Logger.error("Retry query failed: #{inspect(reason)}")
-        []
+        {:error, reason}
     end
   end
 
@@ -433,6 +457,54 @@ defmodule TitanFlow.Campaigns.BufferManager do
 
   defp last_contact_id_or(current, []), do: current
   defp last_contact_id_or(_current, contacts), do: contacts |> List.last() |> Map.get(:id)
+
+  defp handle_contacts_or_exhausted(contacts, state) do
+    if Enum.empty?(contacts) do
+      Logger.info(
+        "BufferManager: No more contacts for campaign #{state.campaign_id}, marking exhausted"
+      )
+
+      Task.start(fn ->
+        TitanFlow.Campaigns.Orchestrator.maybe_redistribute_on_exhaustion(state.campaign_id)
+      end)
+
+      # Trigger completion check asynchronously (don't block BufferManager)
+      Task.start(fn ->
+        # Small delay to ensure last messages are sent
+        Process.sleep(5000)
+        TitanFlow.Campaigns.MessageTracking.check_campaign_completion(state.campaign_id)
+      end)
+
+      %{state | is_exhausted: true}
+    else
+      pushed = push_to_redis(contacts, state.phone_number_id, state.campaign_id)
+
+      cond do
+        state.retry_mode and state.assignment_mode ->
+          new_last_id = contacts |> List.last() |> Map.get(:id)
+
+          Logger.info(
+            "BufferManager: Pushed #{pushed} contacts (retry assignment), cursor now at #{new_last_id}"
+          )
+
+          %{state | last_contact_id: new_last_id, total_pushed: state.total_pushed + pushed}
+
+        state.retry_mode ->
+          Logger.info(
+            "BufferManager: Pushed #{pushed} contacts (retry) failed_cursor=#{state.last_failed_id} nolog_cursor=#{state.last_nolog_id}"
+          )
+
+          %{state | total_pushed: state.total_pushed + pushed}
+
+        true ->
+          new_last_id = contacts |> List.last() |> Map.get(:id)
+
+          Logger.info("BufferManager: Pushed #{pushed} contacts, cursor now at #{new_last_id}")
+
+          %{state | last_contact_id: new_last_id, total_pushed: state.total_pushed + pushed}
+      end
+    end
+  end
 
   defp push_to_redis(contacts, phone_number_id, campaign_id) do
     queue_name = "queue:sending:#{campaign_id}:#{phone_number_id}"

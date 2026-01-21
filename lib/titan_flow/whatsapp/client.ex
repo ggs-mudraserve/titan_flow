@@ -7,6 +7,7 @@ defmodule TitanFlow.WhatsApp.Client do
   """
 
   @graph_api_base "https://graph.facebook.com/v21.0"
+  alias TitanFlow.Http
 
   @doc """
   Send a template message via WhatsApp Cloud API.
@@ -51,7 +52,7 @@ defmodule TitanFlow.WhatsApp.Client do
       }
     }
 
-    case Req.post(url,
+    case Http.post(url,
            finch: TitanFlow.Finch,
            json: payload,
            headers: [
@@ -104,7 +105,7 @@ defmodule TitanFlow.WhatsApp.Client do
       }
     }
 
-    case Req.post(url,
+    case Http.post(url,
            finch: TitanFlow.Finch,
            json: payload,
            headers: [

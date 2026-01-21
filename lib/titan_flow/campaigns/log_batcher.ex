@@ -5,6 +5,7 @@ defmodule TitanFlow.Campaigns.LogBatcher do
   ## Buffers:
   - `buffer:message_logs` → `message_logs` table (via insert_all)
   - `buffer:contact_history` → `contact_history` table (via raw SQL upsert)
+  - `buffer:contact_status` → `campaign_contact_status` table (via raw SQL upsert)
 
   ## Key Features:
   - Transforms JSON string keys to atoms
@@ -42,6 +43,10 @@ defmodule TitanFlow.Campaigns.LogBatcher do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  def flush_contact_status_now do
+    GenServer.call(__MODULE__, :flush_contact_status, 30_000)
+  end
+
   # --- Server Callbacks ---
 
   @impl true
@@ -56,12 +61,19 @@ defmodule TitanFlow.Campaigns.LogBatcher do
     # Check buffer sizes and alert if too large
     check_buffer_sizes()
 
-    # Flush both buffers
+    # Flush buffers
     flush_message_logs()
     flush_contact_history()
+    flush_contact_status()
 
     schedule_tick()
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_call(:flush_contact_status, _from, state) do
+    count = flush_contact_status()
+    {:reply, {:ok, count}, state}
   end
 
   @impl true
@@ -71,6 +83,7 @@ defmodule TitanFlow.Campaigns.LogBatcher do
     # Drain all remaining entries
     drain_buffer(:message_logs)
     drain_buffer(:contact_history)
+    drain_buffer(:contact_status)
 
     Logger.info("LogBatcher drain complete")
     :ok
@@ -94,6 +107,14 @@ defmodule TitanFlow.Campaigns.LogBatcher do
     case Redix.command(:redix, ["LLEN", "buffer:contact_history"]) do
       {:ok, len} when len > @buffer_alert_threshold ->
         Logger.error("CRITICAL: buffer:contact_history at #{len} entries! DB may be struggling.")
+
+      _ ->
+        :ok
+    end
+
+    case Redix.command(:redix, ["LLEN", "buffer:contact_status"]) do
+      {:ok, len} when len > @buffer_alert_threshold ->
+        Logger.error("CRITICAL: buffer:contact_status at #{len} entries! DB may be struggling.")
 
       _ ->
         :ok
@@ -230,6 +251,34 @@ defmodule TitanFlow.Campaigns.LogBatcher do
     end)
   end
 
+  defp flush_contact_status do
+    alias TitanFlow.Campaigns.Metrics
+
+    Metrics.measure_log_flush(:contact_status, fn ->
+      case Redix.command(:redix, ["LPOP", "buffer:contact_status", @batch_size]) do
+        {:ok, nil} ->
+          0
+
+        {:ok, []} ->
+          0
+
+        {:ok, raw_entries} when is_list(raw_entries) ->
+          entries = transform_contact_status(raw_entries)
+
+          if length(entries) > 0 do
+            execute_contact_status_upsert(entries)
+            length(entries)
+          else
+            0
+          end
+
+        {:error, reason} ->
+          Logger.error("LogBatcher: Redis LPOP for contact_status failed: #{inspect(reason)}")
+          0
+      end
+    end)
+  end
+
   defp transform_contact_history(raw_entries) do
     raw_entries
     |> Enum.map(&decode_contact_history_entry/1)
@@ -304,6 +353,72 @@ defmodule TitanFlow.Campaigns.LogBatcher do
     end
   end
 
+  defp transform_contact_status(raw_entries) do
+    raw_entries
+    |> Enum.map(&decode_contact_status_entry/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp decode_contact_status_entry(json_string) do
+    case Jason.decode(json_string) do
+      {:ok, map} ->
+        %{
+          campaign_id: Map.get(map, "campaign_id"),
+          contact_id: Map.get(map, "contact_id"),
+          last_status: Map.get(map, "last_status"),
+          last_error_code: Map.get(map, "last_error_code"),
+          inserted_at: parse_datetime_string(Map.get(map, "inserted_at")),
+          updated_at: parse_datetime_string(Map.get(map, "updated_at"))
+        }
+
+      {:error, reason} ->
+        Logger.error("LogBatcher: Failed to decode contact_status JSON: #{inspect(reason)}")
+        nil
+    end
+  end
+
+  defp execute_contact_status_upsert(entries) do
+    {placeholders, flat_params} =
+      entries
+      |> Enum.with_index()
+      |> Enum.map_reduce([], fn {entry, idx}, acc ->
+        base = idx * 6
+
+        placeholder =
+          "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}, $#{base + 5}, $#{base + 6})"
+
+        params = [
+          entry.campaign_id,
+          entry.contact_id,
+          entry.last_status,
+          entry.last_error_code,
+          entry.inserted_at,
+          entry.updated_at
+        ]
+
+        {placeholder, acc ++ params}
+      end)
+
+    values_clause = Enum.join(placeholders, ", ")
+
+    sql = """
+    INSERT INTO campaign_contact_status (campaign_id, contact_id, last_status, last_error_code, inserted_at, updated_at)
+    VALUES #{values_clause}
+    ON CONFLICT (campaign_id, contact_id) DO UPDATE SET
+      last_status = EXCLUDED.last_status,
+      last_error_code = EXCLUDED.last_error_code,
+      updated_at = EXCLUDED.updated_at
+    """
+
+    case Repo.query(sql, flat_params) do
+      {:ok, result} ->
+        Logger.debug("LogBatcher: Upserted #{result.num_rows} contact status entries")
+
+      {:error, reason} ->
+        Logger.error("LogBatcher: Failed to upsert contact_status: #{inspect(reason)}")
+    end
+  end
+
   # --- Buffer Drain on Shutdown ---
 
   defp drain_buffer(:message_logs) do
@@ -328,6 +443,20 @@ defmodule TitanFlow.Campaigns.LogBatcher do
       {:ok, len} ->
         Logger.info("LogBatcher: Draining #{len} contact history entries...")
         drain_contact_history_loop()
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp drain_buffer(:contact_status) do
+    case Redix.command(:redix, ["LLEN", "buffer:contact_status"]) do
+      {:ok, 0} ->
+        :ok
+
+      {:ok, len} ->
+        Logger.info("LogBatcher: Draining #{len} contact status entries...")
+        drain_contact_status_loop()
 
       _ ->
         :ok
@@ -372,6 +501,28 @@ defmodule TitanFlow.Campaigns.LogBatcher do
         end
 
         drain_contact_history_loop()
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp drain_contact_status_loop do
+    case Redix.command(:redix, ["LPOP", "buffer:contact_status", @batch_size]) do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, []} ->
+        :ok
+
+      {:ok, raw_entries} when is_list(raw_entries) and length(raw_entries) > 0 ->
+        entries = transform_contact_status(raw_entries)
+
+        if length(entries) > 0 do
+          execute_contact_status_upsert(entries)
+        end
+
+        drain_contact_status_loop()
 
       _ ->
         :ok

@@ -8,6 +8,8 @@ defmodule TitanFlow.WhatsApp.MediaUploader do
   """
 
   @graph_api_base "https://graph.facebook.com/v21.0"
+  @http1_connect_opts [protocols: [:http1]]
+  alias TitanFlow.Http
 
   @doc """
   Upload media for use in WhatsApp templates.
@@ -69,8 +71,9 @@ defmodule TitanFlow.WhatsApp.MediaUploader do
            {"type", get_media_type(mime_type)}
          ]}
 
-      case Req.post(url,
+      case Http.post(url,
              body: multipart,
+             connect_options: @http1_connect_opts,
              headers: [
                {"Authorization", "Bearer #{access_token}"}
              ]
@@ -92,10 +95,11 @@ defmodule TitanFlow.WhatsApp.MediaUploader do
   defp create_upload_session(file_size, mime_type, app_id, access_token) do
     url = "#{@graph_api_base}/#{app_id}/uploads"
 
-    case Req.post(url,
+    case Http.post(url,
            headers: [
              {"Authorization", "OAuth #{access_token}"}
            ],
+           connect_options: @http1_connect_opts,
            params: [
              file_length: file_size,
              file_type: mime_type
@@ -123,12 +127,13 @@ defmodule TitanFlow.WhatsApp.MediaUploader do
     url = "#{@graph_api_base}/#{session_id}"
 
     with {:ok, file_binary} <- File.read(file_path) do
-      case Req.post(url,
+      case Http.post(url,
              body: file_binary,
              headers: [
                {"Authorization", "OAuth #{access_token}"},
                {"file_offset", "0"}
-             ]
+             ],
+             connect_options: @http1_connect_opts
            ) do
         {:ok, %Req.Response{status: 200, body: %{"h" => handle}}} ->
           {:ok, handle}

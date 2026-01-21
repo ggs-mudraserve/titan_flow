@@ -5,6 +5,7 @@ defmodule TitanFlow.AI.Handler do
 
   require Logger
   alias TitanFlow.Faqs
+  alias TitanFlow.Http
   alias TitanFlow.WhatsApp
   alias TitanFlow.WhatsApp.Client
   alias TitanFlow.Inbox
@@ -199,7 +200,7 @@ defmodule TitanFlow.AI.Handler do
         temperature: 0.7
       }
 
-      case Req.post(@openai_url,
+      case Http.post(@openai_url,
              json: body,
              headers: [
                {"Authorization", "Bearer #{api_key}"},

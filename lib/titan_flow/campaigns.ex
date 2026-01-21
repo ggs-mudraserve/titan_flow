@@ -190,13 +190,61 @@ defmodule TitanFlow.Campaigns do
               _ -> false
             end
 
+          pipeline_running =
+            try do
+              Registry.lookup(TitanFlow.Campaigns.PipelineRegistry, phone.phone_number_id) != []
+            catch
+              :exit, _ -> false
+            end
+
+          preflight_error =
+            case Redix.command(:redix, [
+                   "GET",
+                   "campaign:#{campaign_id}:phone:#{phone.phone_number_id}:preflight_error"
+                 ]) do
+              {:ok, val} when is_binary(val) and val != "" -> val
+              _ -> nil
+            end
+
+          last_critical_error =
+            case Redix.command(:redix, [
+                   "GET",
+                   "campaign:#{campaign_id}:phone:#{phone.phone_number_id}:last_critical_error"
+                 ]) do
+              {:ok, val} when is_binary(val) and val != "" -> val
+              _ -> nil
+            end
+
+          pipeline_pause_reason =
+            cond do
+              pipeline_running ->
+                nil
+
+              preflight_error ->
+                "Pre-flight failed: #{preflight_error}"
+
+              exhausted and last_critical_error ->
+                "Exhausted: #{format_error_reason(last_critical_error)}"
+
+              exhausted ->
+                "Exhausted: unknown reason"
+
+              paused_until ->
+                "Rate limit pause (131048)"
+
+              true ->
+                "Pipeline not running"
+            end
+
           [
             %{
               phone_id: phone.id,
               phone_number_id: phone.phone_number_id,
               display_name: phone.display_name,
               paused_until_ms: paused_until,
-              exhausted: exhausted
+              exhausted: exhausted,
+              pipeline_running: pipeline_running,
+              pipeline_pause_reason: pipeline_pause_reason
             }
             | acc
           ]
@@ -209,6 +257,15 @@ defmodule TitanFlow.Campaigns do
       _ -> []
     catch
       :exit, _ -> []
+    end
+  end
+
+  defp format_error_reason(code) do
+    case to_string(code) do
+      "131042" -> "payment/eligibility issue (131042)"
+      "131048" -> "spam rate limit (131048)"
+      "131053" -> "account error (131053)"
+      other -> "error #{other}"
     end
   end
 

@@ -66,6 +66,10 @@ defmodule TitanFlow.Campaigns.MessageTracking do
         push_to_buffer("buffer:contact_history", history_map)
       end
 
+      if contact_id do
+        buffer_contact_status(campaign_id, contact_id, "sent")
+      end
+
       # Increment sent count immediately in Redis
       increment_campaign_counter(campaign_id, :sent_count)
 
@@ -119,6 +123,10 @@ defmodule TitanFlow.Campaigns.MessageTracking do
         push_to_buffer("buffer:contact_history", history_map)
       end
 
+      if contact_id do
+        buffer_contact_status(campaign_id, contact_id, "sent")
+      end
+
       # NOTE: Counter NOT incremented here - done by caller before Task.start
       :ok
     rescue
@@ -138,6 +146,30 @@ defmodule TitanFlow.Campaigns.MessageTracking do
         Logger.error("Failed to encode buffer entry: #{inspect(reason)}")
     end
   end
+
+  @doc """
+  Buffer a per-contact status update for async upsert.
+  Used by Pipeline and WebhookBatcher to avoid scanning message_logs.
+  """
+  def buffer_contact_status(campaign_id, contact_id, status, error_code \\ nil)
+
+  def buffer_contact_status(campaign_id, contact_id, status, error_code)
+      when is_integer(campaign_id) and is_integer(contact_id) and is_binary(status) do
+    now = DateTime.utc_now()
+
+    status_map = %{
+      "campaign_id" => campaign_id,
+      "contact_id" => contact_id,
+      "last_status" => status,
+      "last_error_code" => if(error_code, do: to_string(error_code), else: nil),
+      "inserted_at" => DateTime.to_iso8601(now),
+      "updated_at" => DateTime.to_iso8601(now)
+    }
+
+    push_to_buffer("buffer:contact_status", status_map)
+  end
+
+  def buffer_contact_status(_, _, _, _), do: :ok
 
   @doc """
   Record a failed message - called by Pipeline when API returns an error.
@@ -189,6 +221,10 @@ defmodule TitanFlow.Campaigns.MessageTracking do
       }
 
       push_to_buffer("buffer:message_logs", log_map)
+
+      if contact_id do
+        buffer_contact_status(campaign_id, contact_id, "failed", error_code_str)
+      end
 
       # 3. Increment failed count immediately in Redis
       increment_campaign_counter(campaign_id, :failed_count)
@@ -251,6 +287,10 @@ defmodule TitanFlow.Campaigns.MessageTracking do
       push_to_buffer("buffer:message_logs", log_map)
 
       # NOTE: Counter NOT incremented here - done by caller before Task.start
+
+      if contact_id do
+        buffer_contact_status(campaign_id, contact_id, "failed", error_code_str)
+      end
 
       Logger.warning(
         "Recorded failed message for #{recipient_phone}: #{error_code_str} - #{error_message}"
@@ -741,6 +781,10 @@ defmodule TitanFlow.Campaigns.MessageTracking do
           log.recipient_phone,
           log.template_name
         )
+      end
+
+      if log.contact_id do
+        buffer_contact_status(log.campaign_id, log.contact_id, status, error_code)
       end
 
       # P0 FIX: Removed check_campaign_completion from webhook path

@@ -236,27 +236,6 @@ defmodule TitanFlowWeb.CampaignsLive do
   end
 
   @impl true
-  def handle_info(
-        {:campaign_stats_loaded, campaign_id, campaign, stats, template_stats, failed_breakdown},
-        socket
-      ) do
-    if socket.assigns.selected_campaign &&
-         socket.assigns.selected_campaign.id == campaign_id do
-      {:noreply,
-       assign(socket,
-         selected_campaign: campaign,
-         live_stats: stats,
-         template_stats: template_stats,
-         template_stats_updated_at: campaign.updated_at,
-         failed_breakdown: failed_breakdown,
-         failed_breakdown_updated_at: campaign.updated_at
-       )}
-    else
-      {:noreply, socket}
-    end
-  end
-
-  @impl true
   def handle_event("close_stats", _, socket) do
     {:noreply, assign(socket, selected_campaign: nil)}
   end
@@ -287,30 +266,41 @@ defmodule TitanFlowWeb.CampaignsLive do
 
   @impl true
   def handle_event("retry_failed", %{"id" => id}, socket) do
+    {:noreply, push_navigate(socket, to: ~p"/campaigns/#{id}/retry")}
+  end
+
+  @impl true
+  def handle_event(
+        "restart_pipeline",
+        %{"campaign_id" => campaign_id, "phone_number_id" => phone_number_id},
+        socket
+      ) do
     alias TitanFlow.Campaigns.Orchestrator
-    campaign_id = String.to_integer(id)
 
-    # Start retry in background task to not block UI
-    caller = self()
+    campaign_id = String.to_integer(campaign_id)
 
-    Task.start(fn ->
-      result = Orchestrator.retry_failed_contacts(campaign_id)
-      send(caller, {:retry_failed_result, campaign_id, result})
-    end)
+    result = Orchestrator.restart_pipeline_for_phone(campaign_id, phone_number_id)
 
-    page_data = Campaigns.list_campaigns(socket.assigns.page, @per_page)
-    campaign = Campaigns.get_campaign!(id)
+    socket =
+      case result do
+        {:ok, :restarted} ->
+          put_flash(socket, :info, "Pipeline restarted")
 
-    Process.send_after(self(), :refresh_campaigns, 2_000)
+        {:ok, :already_running} ->
+          put_flash(socket, :info, "Pipeline already running")
 
-    {:noreply,
-     socket
-     |> assign(
-       campaigns: page_data.entries,
-       selected_campaign: campaign,
-       retrying_campaigns: MapSet.put(socket.assigns.retrying_campaigns, campaign_id)
-     )
-     |> put_flash(:info, "Retrying failed contacts... Templates synced and campaign restarted.")}
+        {:error, reason} ->
+          put_flash(socket, :error, "Failed to restart pipeline: #{inspect(reason)}")
+      end
+
+    if socket.assigns[:selected_campaign] do
+      campaign = Campaigns.get_campaign!(campaign_id)
+      phone_statuses = Campaigns.phone_statuses(campaign_id)
+
+      {:noreply, assign(socket, selected_campaign: campaign, phone_statuses: phone_statuses)}
+    else
+      {:noreply, socket}
+    end
   end
 
   @impl true
@@ -368,6 +358,27 @@ defmodule TitanFlowWeb.CampaignsLive do
        total_pages: page_data.total_pages,
        total: page_data.total
      )}
+  end
+
+  @impl true
+  def handle_info(
+        {:campaign_stats_loaded, campaign_id, campaign, stats, template_stats, failed_breakdown},
+        socket
+      ) do
+    if socket.assigns.selected_campaign &&
+         socket.assigns.selected_campaign.id == campaign_id do
+      {:noreply,
+       assign(socket,
+         selected_campaign: campaign,
+         live_stats: stats,
+         template_stats: template_stats,
+         template_stats_updated_at: campaign.updated_at,
+         failed_breakdown: failed_breakdown,
+         failed_breakdown_updated_at: campaign.updated_at
+       )}
+    else
+      {:noreply, socket}
+    end
   end
 
   @impl true
@@ -790,6 +801,44 @@ defmodule TitanFlowWeb.CampaignsLive do
                     Final contact list: <span class="font-mono font-medium"><%= @campaign.total_records %></span> contacts
                   </div>
                 </div>
+              </div>
+            </div>
+          <% end %>
+
+          <%= if (@campaign.status == "running" or @retrying) and Enum.any?(@phone_statuses) do %>
+            <div class="bg-zinc-800/50 rounded-lg p-4 border border-zinc-800">
+              <div class="text-sm font-medium text-zinc-300">Pipelines</div>
+              <div class="mt-2 space-y-2">
+                <%= for status <- @phone_statuses do %>
+                  <div class="flex items-center justify-between text-xs">
+                    <div class="text-zinc-300">
+                      <%= status.display_name || status.phone_number_id %>
+                      <span class="text-zinc-500">(<%= status.phone_number_id %>)</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                      <%= if status.pipeline_running do %>
+                        <span class="text-emerald-400 font-medium">Pipeline Running</span>
+                      <% else %>
+                        <div class="flex flex-col items-end gap-1">
+                          <span class="text-amber-400 font-medium">Pipeline Paused</span>
+                          <%= if status.pipeline_pause_reason do %>
+                            <span class="text-[11px] text-zinc-400"><%= status.pipeline_pause_reason %></span>
+                          <% end %>
+                        </div>
+                        <button
+                          type="button"
+                          phx-click="restart_pipeline"
+                          phx-value-campaign_id={@campaign.id}
+                          phx-value-phone_number_id={status.phone_number_id}
+                          phx-disable-with="Restarting..."
+                          class="px-2 py-1 rounded bg-zinc-700 text-zinc-200 hover:bg-zinc-600 border border-zinc-600"
+                        >
+                          Restart
+                        </button>
+                      <% end %>
+                    </div>
+                  </div>
+                <% end %>
               </div>
             </div>
           <% end %>

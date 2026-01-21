@@ -10,6 +10,8 @@ defmodule TitanFlow.Application do
     # Get Redis config
     redix_config = Application.get_env(:titan_flow, :redix)
 
+    ca_certfile = System.get_env("SSL_CERT_FILE") || "/etc/ssl/certs/ca-certificates.crt"
+
     children = [
       TitanFlowWeb.Telemetry,
       TitanFlow.Repo,
@@ -18,7 +20,15 @@ defmodule TitanFlow.Application do
 
       # HTTP Client Connection Pool
       # Supports 500 concurrent connections to Meta API
-      {Finch, name: TitanFlow.Finch, pools: %{default: [size: 500, count: 1]}},
+      {Finch,
+       name: TitanFlow.Finch,
+       pools: %{
+         default: [
+           size: 500,
+           count: 1,
+           conn_opts: [transport_opts: [cacertfile: ca_certfile]]
+         ]
+       }},
 
       # Redis connection pool
       {Redix,
@@ -76,8 +86,14 @@ defmodule TitanFlow.Application do
       # Log Batcher for async message_logs and contact_history batch inserts (Formula 1 v2)
       TitanFlow.Campaigns.LogBatcher,
 
+      # Weekly data retention cleanup (midnight IST)
+      TitanFlow.Campaigns.DataRetention,
+
       # P2 FIX: Webhook status update batcher (reduces DB writes by 100x)
       TitanFlow.Campaigns.WebhookBatcher,
+
+      # Dedicated retry pipeline for template webhook failures
+      TitanFlow.Campaigns.TemplateRetryPipeline,
 
       # P1 FIX: Debounced completion checker (every 30s instead of per webhook)
       TitanFlow.Campaigns.CompletionChecker,

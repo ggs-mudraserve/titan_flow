@@ -150,7 +150,13 @@ defmodule TitanFlow.Campaigns.MetricsReporter do
         _ -> 0
       end
 
-    message_logs + contact_history
+    contact_status =
+      case Redix.command(:redix, ["LLEN", "buffer:contact_status"]) do
+        {:ok, len} when is_integer(len) -> len
+        _ -> 0
+      end
+
+    message_logs + contact_history + contact_status
   end
 
   defp get_total_sent do

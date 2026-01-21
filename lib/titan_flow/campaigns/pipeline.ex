@@ -28,6 +28,7 @@ defmodule TitanFlow.Campaigns.Pipeline do
   @spam_resume_mps 20
   @exhausted_drain_batch_size 500
   @exhausted_drain_ttl_ms 86_400_000
+  @template_error_codes [132_000, 132_001, 132_015, 132_016, 132_068, 133_004]
 
   @doc """
   Start a Broadway pipeline for a specific phone number's queue.
@@ -267,6 +268,28 @@ defmodule TitanFlow.Campaigns.Pipeline do
     mark_phone_exhausted(campaign_id, phone_number_id)
   end
 
+  def handle_template_webhook_error(campaign_id, phone_number_id, template_name, error_code) do
+    if template_error_code?(error_code) and is_binary(template_name) and template_name != "" and
+         not is_nil(campaign_id) and not is_nil(phone_number_id) do
+      case resolve_template_id(template_name) do
+        {:ok, template_id} ->
+          mark_template_exhausted(campaign_id, phone_number_id, template_id, "#{error_code}")
+          {:ok, template_id}
+
+        {:error, reason} ->
+          require Logger
+
+          Logger.warning(
+            "Template webhook error: Unable to resolve template #{template_name} (#{inspect(reason)})"
+          )
+
+          {:error, reason}
+      end
+    else
+      :ignore
+    end
+  end
+
   defp maybe_handle_spam_rate_limit(campaign_id, phone_number_id) do
     now_ms = System.system_time(:millisecond)
     window_key = "campaign:#{campaign_id}:phone:#{phone_number_id}:131048_window"
@@ -372,6 +395,39 @@ defmodule TitanFlow.Campaigns.Pipeline do
     Logger.warning(
       "Template #{template_id} marked as exhausted for phone #{phone_number_id} in campaign #{campaign_id} (error: #{error_code})"
     )
+  end
+
+  defp template_error_code?(error_code) do
+    normalize_error_code(error_code) in @template_error_codes
+  end
+
+  defp normalize_error_code(error_code) do
+    cond do
+      is_integer(error_code) ->
+        error_code
+
+      is_binary(error_code) ->
+        case Integer.parse(error_code) do
+          {n, _} -> n
+          :error -> 0
+        end
+
+      true ->
+        0
+    end
+  end
+
+  defp resolve_template_id(template_name) do
+    case TitanFlow.Templates.TemplateCache.get_by_name(template_name) do
+      {:ok, template} ->
+        {:ok, template.id}
+
+      _ ->
+        case TitanFlow.Templates.get_template_by_name(template_name) do
+          nil -> {:error, :not_found}
+          template -> {:ok, template.id}
+        end
+    end
   end
 
   # Mark entire phone as exhausted (all templates failed)
@@ -593,20 +649,7 @@ defmodule TitanFlow.Campaigns.Pipeline do
   # Now accepts the actual Meta error code directly, not a string to parse
   defp should_try_next_template?(error_code, template_id, campaign_id, phone_number_id) do
     # Normalize to integer if it's a string
-    code =
-      case error_code do
-        c when is_integer(c) ->
-          c
-
-        c when is_binary(c) ->
-          case Integer.parse(c) do
-            {n, _} -> n
-            :error -> 0
-          end
-
-        _ ->
-          0
-      end
+    code = normalize_error_code(error_code)
 
     cond do
       # CRITICAL: Payment/Account errors - mark PHONE as exhausted, not just template
@@ -622,7 +665,7 @@ defmodule TitanFlow.Campaigns.Pipeline do
         false
 
       # Template-specific errors - try next template
-      code in [132_000, 132_001, 132_015, 132_016, 132_068, 133_004] ->
+      code in @template_error_codes ->
         require Logger
 
         Logger.warning(

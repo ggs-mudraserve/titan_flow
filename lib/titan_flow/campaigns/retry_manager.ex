@@ -135,6 +135,23 @@ defmodule TitanFlow.Campaigns.RetryManager do
     end
   end
 
+  @doc """
+  Requeue a single failed message after a template webhook error so it can
+  be retried with the next available template for the same phone.
+  """
+  def retry_template_message(message_log) do
+    with {:ok, log} <- normalize_message_log(message_log),
+         campaign_id when not is_nil(campaign_id) <- log.campaign_id,
+         phone_number_id when not is_nil(phone_number_id) <- log.phone_number_id,
+         recipient_phone when not is_nil(recipient_phone) <- log.recipient_phone,
+         contact_id when not is_nil(contact_id) <- log.contact_id,
+         false <- phone_exhausted?(campaign_id, to_string(phone_number_id)) do
+      requeue_message(log, to_string(phone_number_id), campaign_id)
+    else
+      _ -> :skip
+    end
+  end
+
   defp get_failed_template_messages(template_name, campaign_id) do
     one_hour_ago = DateTime.utc_now() |> DateTime.add(-3600, :second)
 
@@ -174,6 +191,38 @@ defmodule TitanFlow.Campaigns.RetryManager do
 
       _ ->
         :skip
+    end
+  end
+
+  defp phone_exhausted?(campaign_id, phone_number_id) do
+    case Redix.command(:redix, [
+           "SISMEMBER",
+           "campaign:#{campaign_id}:exhausted_phones",
+           phone_number_id
+         ]) do
+      {:ok, 1} -> true
+      _ -> false
+    end
+  end
+
+  defp normalize_message_log(%MessageLog{} = log), do: {:ok, log}
+
+  defp normalize_message_log(%{meta_message_id: meta_message_id})
+       when is_binary(meta_message_id) do
+    fetch_message_log(meta_message_id)
+  end
+
+  defp normalize_message_log(%{"meta_message_id" => meta_message_id})
+       when is_binary(meta_message_id) do
+    fetch_message_log(meta_message_id)
+  end
+
+  defp normalize_message_log(_), do: {:error, :invalid_message_log}
+
+  defp fetch_message_log(meta_message_id) do
+    case Repo.get_by(MessageLog, meta_message_id: meta_message_id) do
+      nil -> {:error, :not_found}
+      log -> {:ok, log}
     end
   end
 

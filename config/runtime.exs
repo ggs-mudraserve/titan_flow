@@ -20,16 +20,20 @@ if System.get_env("PHX_SERVER") do
   config :titan_flow, TitanFlowWeb.Endpoint, server: true
 end
 
+phx_host = System.get_env("PHX_HOST") || "dashboard.getfastloans.in"
+
 config :titan_flow, TitanFlowWeb.Endpoint,
-  url: [host: "dashboard.getfastloans.in", port: 443, scheme: "https"],
+  url: [host: phx_host, port: 443, scheme: "https"],
   http: [port: String.to_integer(System.get_env("PORT", "4000"))],
-  check_origin: ["//dashboard.getfastloans.in", "//localhost"]
+  check_origin: ["//#{phx_host}", "//localhost"]
 
 # PostgreSQL Database Configuration (all environments)
 # Using Supavisor connection pooler (port 6543) - REQUIRED for production
 # Direct connection (port 5432/5433) will cause "too_many_connections" errors
 # FORCED to Supavisor
 db_port = String.to_integer(System.get_env("DATABASE_PORT") || "6543")
+
+db_host = System.get_env("DATABASE_HOST") || "127.0.0.1"
 
 # Warn if using direct PostgreSQL port in production
 if config_env() == :prod and db_port in [5432, 5433] do
@@ -44,7 +48,7 @@ config :titan_flow, TitanFlow.Repo,
   # Supavisor requires tenant format: postgres.{tenant_id} where tenant_id = "postgres"
   username: System.get_env("DATABASE_USERNAME") || "postgres.postgres",
   password: System.get_env("DATABASE_PASSWORD") || "dWupoUeRBRJcr_7NGOIw_RLleVpd8c5AySgWV10Zp9Q",
-  hostname: System.get_env("DATABASE_HOST") || "85.17.142.45",
+  hostname: db_host,
   port: db_port,
   # Your actual database name
   database: System.get_env("DATABASE_NAME") || "titan_flow",
@@ -57,17 +61,22 @@ config :titan_flow, TitanFlow.Repo,
   queue_target: 5000,
   # Check queue every second
   queue_interval: 1000,
-  # Query timeout: 15 seconds (default is 15000)
-  timeout: 15000,
+  # Query timeout: 60 seconds
+  timeout: 60_000,
   # How long to wait to get a connection from pool
-  checkout_timeout: 15000,
-  socket_options: socket_opts
+  checkout_timeout: 60_000,
+  socket_options: socket_opts,
+  after_connect: {Postgrex, :query!, ["SET statement_timeout = 60000", []]}
+
+redis_host = System.get_env("REDIS_HOST") || "127.0.0.1"
+redis_port = String.to_integer(System.get_env("REDIS_PORT") || "6379")
+redis_password = System.get_env("REDIS_PASSWORD")
 
 # Redis Configuration (Redix)
 config :titan_flow, :redix,
-  host: "85.17.142.45",
-  port: 6379,
-  password: "J4Rlz_-uxl8FTFdoKn9sYksG628c8EFZUVJNuoHFQRU"
+  host: redis_host,
+  port: redis_port,
+  password: redis_password
 
 # ClickHouse removed - using Postgres for all logging
 
@@ -79,9 +88,9 @@ config :hammer,
        # Keep buckets for 2 hours
        expiry_ms: 60_000 * 60 * 2,
        redix_config: [
-         host: "85.17.142.45",
-         port: 6379,
-         password: "J4Rlz_-uxl8FTFdoKn9sYksG628c8EFZUVJNuoHFQRU"
+         host: redis_host,
+         port: redis_port,
+         password: redis_password
        ]
      ]}
 
@@ -109,7 +118,7 @@ if config_env() == :prod do
       You can generate one by calling: mix phx.gen.secret
       """
 
-  host = System.get_env("PHX_HOST") || "example.com"
+  host = phx_host
 
   config :titan_flow, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
 

@@ -4,6 +4,7 @@ defmodule TitanFlow.WhatsApp do
   """
 
   import Ecto.Query
+  alias TitanFlow.Http
   alias TitanFlow.Repo
   alias TitanFlow.WhatsApp.PhoneNumber
 
@@ -73,7 +74,7 @@ defmodule TitanFlow.WhatsApp do
   def sync_phone_number(%PhoneNumber{} = phone_number) do
     url = "https://graph.facebook.com/v21.0/#{phone_number.phone_number_id}"
 
-    case Req.get(url, headers: [{"Authorization", "Bearer #{phone_number.access_token}"}]) do
+    case Http.get(url, headers: [{"Authorization", "Bearer #{phone_number.access_token}"}]) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         quality_rating = get_in(body, ["quality_rating"]) || "GREEN"
         display_name = get_in(body, ["verified_name"]) || get_in(body, ["display_phone_number"])
